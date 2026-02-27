@@ -30,6 +30,7 @@ See `lein run test --help` and `lein run test-all --help` for options.
 
 + **append** Checks for dependency cycles in append/read transactions
 + **bank** concurrent transfers between rows of a shared table
++ **bank-mview** bank variant which reads from a 1:1 materialized view of `accounts`
 + **bank-multitable** multi-table variant of the bank test
 + **long-fork** distinguishes between parallel snapshot isolation and standard SI
 + **monotonic** looks for contradictory orders over increment-only registers
