@@ -17,6 +17,7 @@
             [jepsen.os.debian :as debian]
             [jepsen.os.centos :as centos]
             [tidb [bank :as bank]
+             [bank-mview :as bank-mview]
              [comments :as comments]
              [db :as db]
              [long-fork :as long-fork]
@@ -45,6 +46,7 @@
   "A map of workload names to functions that can take CLI opts and construct
   workloads."
   {:bank            bank/workload
+   :bank-mview       bank-mview/workload
    :bank-multitable bank/multitable-workload
    :comments        comments/workload
    :long-fork       long-fork/workload
@@ -68,6 +70,10 @@
                      :auto-retry-limit      [10 0]
                      :update-in-place       [true false]
                      :read-lock             [nil "FOR UPDATE"]}
+   :bank-mview       {:auto-retry            [true false]
+                      :auto-retry-limit      [10 0]
+                      :update-in-place       [true false]
+                      :read-lock             [nil "FOR UPDATE"]}
    :bank-multitable {:auto-retry            [true false]
                      :auto-retry-limit      [10 0]
                      :update-in-place       [true false]
@@ -356,7 +362,8 @@
                                 (gen/log "Healing cluster")
                                 (gen/nemesis (:final-generator nemesis))
                                 (gen/log "Waiting for recovery")
-                                (gen/sleep (:final-recovery-time opts))
+                                (gen/sleep (or (:final-recovery-time opts)
+                                               (:recovery-time opts)))
                                 (gen/clients (:final-generator workload)))
                     gen)]
     (merge tests/noop-test
