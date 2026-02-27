@@ -130,9 +130,11 @@
   []
   (reify checker/Checker
     (check [_ _ history _]
-      (let [checks (filter #(= :check (:f %)) history)
-            oks    (filter op/ok? checks)
-            fails  (remove op/ok? checks)]
+      (let [checks (->> history
+                        (filter #(= :check (:f %)))
+                        (filter #(#{:ok :fail} (:type %))))
+            oks   (filter op/ok? checks)
+            fails (filter #(= :fail (:type %)) checks)]
         {:valid? (and (seq checks) (empty? fails))
          :check-count (count checks)
          :ok-count (count oks)
