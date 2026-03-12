@@ -17,11 +17,15 @@
             [jepsen.os.debian :as debian]
             [jepsen.os.centos :as centos]
             [tidb [bank :as bank]
-             [bank-mview :as bank-mview]
              [comments :as comments]
              [db :as db]
              [long-fork :as long-fork]
              [monotonic :as monotonic]
+             [manifest :as manifest]
+             [mv-autosched :as mv-autosched]
+             [mv-autosched-time :as mv-autosched-time]
+             [mv-lifecycle :as mv-lifecycle]
+             [mv-stateful :as mv-stateful]
              [nemesis :as nemesis]
              [register :as register]
              [sequential :as sequential]
@@ -46,8 +50,11 @@
   "A map of workload names to functions that can take CLI opts and construct
   workloads."
   {:bank            bank/workload
-   :bank-mview       bank-mview/workload
    :bank-multitable bank/multitable-workload
+   :mv-autosched    mv-autosched/workload
+   :mv-autosched-time mv-autosched-time/workload
+   :mv-lifecycle    mv-lifecycle/workload
+   :mv-stateful     mv-stateful/workload
    :comments        comments/workload
    :long-fork       long-fork/workload
    :monotonic       monotonic/inc-workload
@@ -70,14 +77,13 @@
                      :auto-retry-limit      [10 0]
                      :update-in-place       [true false]
                      :read-lock             [nil "FOR UPDATE"]}
-   :bank-mview       {:auto-retry            [true false]
-                      :auto-retry-limit      [10 0]
-                      :update-in-place       [true false]
-                      :read-lock             [nil "FOR UPDATE"]}
    :bank-multitable {:auto-retry            [true false]
                      :auto-retry-limit      [10 0]
                      :update-in-place       [true false]
                      :read-lock             [nil "FOR UPDATE"]}
+   :mv-autosched    {}
+   :mv-lifecycle    {}
+   :mv-stateful     {}
    :comments        {:auto-retry            [true false]
                      :auto-retry-limit      [10 0]}
    :long-fork       {:auto-retry            [true false]
@@ -108,6 +114,11 @@
                              :auto-retry        [false]
                              :auto-retry-limit  [0])
                      workload-options)))
+(def test-all-workloads
+  "Workloads supported by the test-all matrix generator. Workloads absent from
+  workload-options remain single-test only."
+  (set (keys workload-options)))
+
 
 (def quick-workload-options
   "A restricted set of workload options which skips some redundant tests and
@@ -180,7 +191,7 @@
     :random-merge
     :failpoint
     :netem
-    ; :clock-skew
+    :clock-skew
     ; Special-case generators
     ; :slow-primary
     :restart-kv-without-pd})
@@ -308,11 +319,11 @@
                :color       "#FCBA03"
                :start       #{:start-netem}
                :stop        #{:stop-netem}}
-              ;{:name        "clock"
-              ; :color       "#A0E9DB"
-              ; :start       #{:strobe-clock :bump-clock}
-              ; :stop        #{:reset-clock}
-              ; :fs          #{:check-clock-offsets}}
+              {:name        "clock"
+               :color       "#A0E9DB"
+               :start       #{:strobe-clock :bump-clock}
+               :stop        #{:reset-clock}
+               :fs          #{:check-clock-offsets}}
               }})
 
 (defn test
@@ -353,6 +364,7 @@
                                           sort
                                           (str/join ",")))))
         workload  ((get workloads (:workload opts)) opts)
+        nemesis-spec (:nemesis opts)
         nemesis   (nemesis/nemesis opts)
         gen       (->> (:generator workload)
                        (gen/nemesis (:generator nemesis))
@@ -369,15 +381,17 @@
     (merge tests/noop-test
            opts
            (dissoc workload :final-generator)
-           {:name       name
-            :db         (db/db)
-            :client     (:client workload)
-            :nemesis    (:nemesis nemesis)
-            :generator  gen
+           {:name         name
+            :db           (db/db)
+            :client       (:client workload)
+            :nemesis-spec nemesis-spec
+            :nemesis      (:nemesis nemesis)
+            :generator    gen
             :plot       plot-spec
             :checker    (checker/compose
                          {:perf        (checker/perf)
-                           ; :clock-skew  (checker/clock-plot)
+                          :manifest    (manifest/checker*)
+                           :clock-skew  (checker/clock-plot)
                           :workload    (:checker workload)})})))
 
 (defn parse-nemesis-spec
@@ -405,6 +419,10 @@
        (map str/trim)
        (drop-while empty)
        (map #(str/split % #":"))))
+
+(defn parse-feature-flags
+  [s]
+  (manifest/parse-feature-flags s))
 
 (def cli-opts
   "Command line options for tools.cli"
@@ -480,6 +498,22 @@
                      (drop-while empty?)))]
 
    [nil "--tarball-url URL" "URL to TiDB tarball to install, has precedence over --version"
+    :default nil]
+
+   [nil "--build-branch NAME" "Source branch name for the build under test."
+    :default nil]
+
+   [nil "--build-commit-sha SHA" "Exact git commit of the build under test."
+    :default nil]
+
+   [nil "--build-time ISO8601" "Build timestamp for the package under test."
+    :default nil]
+
+   [nil "--build-notes TEXT" "Free-form notes to include in the build manifest."
+    :default nil]
+
+   [nil "--feature-flags JSON_OR_EDN" "Feature flags required by the build under test, in JSON or EDN."
+    :parse-fn parse-feature-flags
     :default nil]])
 
 (def test-all-opts
@@ -488,10 +522,10 @@
     :default false]
 
    ["-w" "--workload NAME"
-    "Test workload to run. If omitted, runs all workloads"
+    "Test workload to run. If omitted, runs all test-all workloads"
     :parse-fn keyword
     :default nil
-    :validate [workloads (jc/one-of workloads)]]
+    :validate [test-all-workloads (jc/one-of test-all-workloads)]]
 
    [nil "--only-workloads-expected-to-pass"
     "If present, skips tests which are not expected to pass, given Fauna's docs"
