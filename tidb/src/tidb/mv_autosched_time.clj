@@ -615,7 +615,7 @@
       (let [snapshot-values (->> history
                                  (filter #(and (= :snapshot (:f %))
                                                (op/ok? %)))
-                                 (mapv :value))
+                                 (mapv autosched/snapshot-result))
             analysis        (time-analysis test history snapshot-values)
             anomalies       (:anomalies analysis)
             warnings        (:warnings analysis)]

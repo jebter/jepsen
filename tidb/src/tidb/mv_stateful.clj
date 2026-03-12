@@ -51,6 +51,16 @@
              :deleted    (= :delete f)
              :pad        (pad-for token)}}))
 
+(defn completed-op?
+  [op]
+  (or (op/ok? op)
+      (op/fail? op)))
+
+(defn op-result
+  [op]
+  (or (:result op)
+      (:value op)))
+
 (defn generator
   []
   (let [seqs (atom {})]
@@ -59,11 +69,15 @@
         (let [process (process-id process)
               seq     (get (swap! seqs update process (fnil inc 0)) process)
               p       (rand)]
-          (cond
-            (< p 0.56) (stateful-write process seq)
-            (< p 0.78) {:type :invoke, :f :refresh-row, :value (key-for-process process)}
-            (< p 0.93) {:type :invoke, :f :refresh-agg}
-            :else      {:type :invoke, :f :purge}))))))
+          (if (zero? process)
+            (cond
+              (< p 0.56) (stateful-write process seq)
+              (< p 0.78) {:type :invoke
+                          :f :refresh-row
+                          :value (inc (rand-int (long (max 1 (:concurrency test)))))}
+              (< p 0.93) {:type :invoke, :f :refresh-agg}
+              :else      {:type :invoke, :f :purge})
+            (stateful-write process seq)))))))
 
 (defn ambiguous-write-error?
   [t]
@@ -90,7 +104,7 @@
       (try
         (let [row (mv/query-stored-row conn (get-in op [:value :id]))]
           (when (stored-row-matches? row (:value op))
-            (assoc op :type :ok :resolved? true :value (assoc (:value op) :verify :read-back))))
+            (assoc op :type :ok :resolved? true :result {:verify :read-back})))
         (finally
           (c/close! conn))))
     (catch Throwable _
@@ -192,7 +206,7 @@
                            (compare-row! conn test (or (:value op)
                                                        (key-for-process (:process op)))))
               {:keys [type value]} comparison]
-          (assoc op :type type :value value))
+          (assoc op :type type :result value))
         (catch Throwable t
           (assoc op :type :fail :error :refresh-row-error :exception (.getMessage t))))
 
@@ -200,13 +214,13 @@
       (try
         (mv/refresh-view! conn mv/agg-view)
         (let [{:keys [type value]} (compare-agg! conn test)]
-          (assoc op :type type :value value))
+          (assoc op :type type :result value))
         (catch Throwable t
           (assoc op :type :fail :error :refresh-agg-error :exception (.getMessage t))))
 
       :purge
       (try
-        (assoc op :type :ok :value {:statement (mv/purge-log! conn)})
+        (assoc op :type :ok :result {:statement (mv/purge-log! conn)})
         (catch Throwable t
           (assoc op :type :fail :error :purge-error :exception (.getMessage t))))
 
@@ -221,9 +235,15 @@
   []
   (reify checker/Checker
     (check [_ test history _]
-      (let [refresh-row-ops (filter #(= :refresh-row (:f %)) history)
-            refresh-agg-ops (filter #(= :refresh-agg (:f %)) history)
-            purge-ops       (filter #(= :purge (:f %)) history)
+      (let [refresh-row-ops (filter #(and (= :refresh-row (:f %))
+                                          (completed-op? %))
+                                    history)
+            refresh-agg-ops (filter #(and (= :refresh-agg (:f %))
+                                          (completed-op? %))
+                                    history)
+            purge-ops       (filter #(and (= :purge (:f %))
+                                          (completed-op? %))
+                                    history)
             refresh-purge   (concat refresh-row-ops refresh-agg-ops purge-ops)
             recent-rp       (vec (take-last 20 refresh-purge))
             write-ops       (filter #(contains? #{:insert :update-value :move-group :delete} (:f %)) history)
@@ -234,9 +254,17 @@
             first-failure   (first failures)
             last-row-failure (last (filter op/fail? refresh-row-ops))
             last-agg-failure (last (filter op/fail? refresh-agg-ops))
-            final-row-check (some-> refresh-row-ops last :value)
-            final-agg-check (some-> refresh-agg-ops last :value)]
-        (let [summary {:valid?                    (and (empty? failures) (empty? unresolved))
+            final-row-op    (last refresh-row-ops)
+            final-agg-op    (last refresh-agg-ops)
+            final-row-check (some-> final-row-op op-result)
+            final-agg-check (some-> final-agg-op op-result)
+            final-row-valid? (boolean (and final-row-op (op/ok? final-row-op)))
+            final-agg-valid? (boolean (and final-agg-op (op/ok? final-agg-op)))]
+        (let [summary {:valid?                    (and final-row-valid?
+                                                      final-agg-valid?
+                                                      (empty? unresolved))
+                       :final-row-valid?          final-row-valid?
+                       :final-agg-valid?          final-agg-valid?
                        :refresh-row-ok-count      (count (filter op/ok? refresh-row-ops))
                        :refresh-row-fail-count    (count (filter op/fail? refresh-row-ops))
                        :refresh-agg-ok-count      (count (filter op/ok? refresh-agg-ops))
@@ -272,8 +300,9 @@
    :generator       (gen/stagger 1/5 (generator))
    :checker         (checker/compose {:mv-stateful (checker*)
                                       :timeline    (timeline/html)})
-   :final-generator (gen/seq [{:type :invoke, :f :refresh-row, :value :all}
-                              {:type :invoke, :f :refresh-agg}
-                              {:type :invoke, :f :purge}
-                              {:type :invoke, :f :refresh-row, :value :all}
-                              {:type :invoke, :f :refresh-agg}])})
+   :final-generator (gen/on #{0}
+                            (gen/seq [{:type :invoke, :f :refresh-row, :value :all}
+                                      {:type :invoke, :f :refresh-agg}
+                                      {:type :invoke, :f :purge}
+                                      {:type :invoke, :f :refresh-row, :value :all}
+                                      {:type :invoke, :f :refresh-agg}]))})

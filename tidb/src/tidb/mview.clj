@@ -7,6 +7,8 @@
 (def base-table "mv_stateful_base")
 (def row-view "mv_stateful_row")
 (def agg-view "mv_stateful_agg")
+(def refresh-lock-retry-count 5)
+(def refresh-lock-retry-ms 250)
 
 (declare try-statements!)
 
@@ -40,7 +42,8 @@
                     " version    bigint       NOT NULL,\n"
                     " last_token varchar(128) NOT NULL,\n"
                     " deleted    tinyint      NOT NULL DEFAULT 0,\n"
-                    " pad        varchar(64)  NOT NULL)")]))
+                    " pad        varchar(64)  NOT NULL,\n"
+                    " KEY idx_mv_stateful_g1_deleted_v1 (g1, deleted, v1))")]))
 
 (defn split-base-table!
   [conn ids]
@@ -104,15 +107,10 @@
                     "(id, g1, v1, version, last_token, live_cnt) "
                     "COMMENT = 'jepsen:mv-stateful(row)' "
                     "REFRESH FAST AS "
-                    "SELECT id, "
-                    "MAX(g1)         AS g1, "
-                    "MAX(v1)         AS v1, "
-                    "MAX(version)    AS version, "
-                    "MAX(last_token) AS last_token, "
-                    "COUNT(*)        AS live_cnt "
+                    "SELECT id, g1, v1, version, last_token, COUNT(*) AS live_cnt "
                     "FROM " base-table " "
                     "WHERE deleted = 0 "
-                    "GROUP BY id")]))
+                    "GROUP BY id, g1, v1, version, last_token")]))
 
 (defn create-agg-view!
   [conn]
@@ -130,7 +128,14 @@
                     "WHERE deleted = 0 "
                     "GROUP BY g1")]))
 
-(defn- try-statements!
+(defn- refresh-lock-conflict?
+  [^java.sql.SQLException e]
+  (let [message (str (.getMessage e))]
+    (boolean
+     (re-find #"lock\(s\) could not be acquired immediately|NOWAIT is set"
+              message))))
+
+(defn- try-statements-once!
   [conn label statements]
   (loop [remaining statements
          last-error nil]
@@ -139,13 +144,35 @@
                      {:stmt (do (c/execute! conn [stmt]) stmt)}
                      (catch java.sql.SQLException e
                        (info label (.getMessage e) "stmt=" stmt)
-                       {:error e}))]
+                       (if (refresh-lock-conflict? e)
+                         (throw e)
+                         {:error e})))]
         (if-let [ok-stmt (:stmt result)]
           ok-stmt
           (recur (rest remaining) (:error result))))
       (if last-error
         (throw last-error)
         nil))))
+
+(defn- try-statements!
+  [conn label statements]
+  (loop [attempt 1]
+    (let [result (try
+                   {:stmt (try-statements-once! conn label statements)}
+                   (catch java.sql.SQLException e
+                     {:error e}))]
+      (if-let [stmt (:stmt result)]
+        stmt
+        (let [e (:error result)]
+          (if (and (refresh-lock-conflict? e)
+                   (< attempt refresh-lock-retry-count))
+            (do
+              (info label "Retrying after transient lock conflict"
+                    "attempt=" attempt
+                    "error=" (.getMessage e))
+              (Thread/sleep refresh-lock-retry-ms)
+              (recur (inc attempt)))
+            (throw e)))))))
 
 (defn refresh-view!
   [conn view]
@@ -338,8 +365,14 @@
 
 (defn query-mv-row
   [conn id]
-  (-> (c/query conn [(str "SELECT id, g1, v1, version, last_token, live_cnt "
-                           "FROM " row-view " WHERE id = ?")
+  (-> (c/query conn [(str "SELECT id, "
+                           "MAX(g1) AS g1, "
+                           "MAX(v1) AS v1, "
+                           "MAX(version) AS version, "
+                           "MAX(last_token) AS last_token, "
+                           "SUM(live_cnt) AS live_cnt "
+                           "FROM " row-view " WHERE id = ? "
+                           "GROUP BY id")
                      id])
       first
       normalize-mv-row))
@@ -359,8 +392,14 @@
 
 (defn query-mv-row-projection
   [conn]
-  (->> (c/query conn [(str "SELECT id, g1, v1, version, last_token, live_cnt "
-                           "FROM " row-view " ORDER BY id")])
+  (->> (c/query conn [(str "SELECT id, "
+                           "MAX(g1) AS g1, "
+                           "MAX(v1) AS v1, "
+                           "MAX(version) AS version, "
+                           "MAX(last_token) AS last_token, "
+                           "SUM(live_cnt) AS live_cnt "
+                           "FROM " row-view " "
+                           "GROUP BY id ORDER BY id")])
        (map (fn [row]
               [(long (:id row))
                {:id         (long (:id row))

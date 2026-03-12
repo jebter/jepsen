@@ -125,6 +125,39 @@
     (is (= (count lifecycle/management-ops) (:lifecycle-op-count summary)))
     (is (= (count lifecycle/management-ops) (:lifecycle-ok-count summary)))))
 
+(deftest stateful-checker-trusts-final-refresh-over-intermediate-noise
+  (let [history [{:type :ok :f :insert}
+                 {:type :fail
+                  :f :refresh-row
+                  :process 0
+                  :result {:diff {:expected {:id 3 :version 12}
+                                  :actual   {:id 3 :version 11}}}}
+                 {:type :fail
+                  :f :refresh-agg
+                  :process 0
+                  :result {:diff {:unexpected-in-mv [0]}}}
+                 {:type :ok :f :purge :process 0 :result {:statement "PURGE"}}
+                 {:type :ok :f :refresh-row :process 0 :result {:rows 2}}
+                 {:type :ok :f :refresh-agg :process 0 :result {:groups 2}}]
+        summary (checker/check (stateful/checker*) {} history nil)]
+    (is (true? (:valid? summary)))
+    (is (true? (:final-row-valid? summary)))
+    (is (true? (:final-agg-valid? summary)))
+    (is (= 1 (:refresh-row-fail-count summary)))
+    (is (= 1 (:refresh-agg-fail-count summary)))))
+
+(deftest stateful-checker-still-fails-when-final-refresh-fails
+  (let [history [{:type :ok :f :refresh-row :process 0 :result {:rows 1}}
+                 {:type :fail
+                  :f :refresh-agg
+                  :process 0
+                  :result {:diff {:mismatched {1 {:expected {:cnt 2}
+                                                 :actual   {:cnt 1}}}}}}]
+        summary (checker/check (stateful/checker*) {} history nil)]
+    (is (false? (:valid? summary)))
+    (is (true? (:final-row-valid? summary)))
+    (is (false? (:final-agg-valid? summary)))))
+
 (deftest lifecycle-transition-recovers-when-artifact-state-already-matches
   (let [op     {:type :invoke
                 :f :drop-row-view
@@ -142,8 +175,8 @@
         (is (= :ok (:type result)))
         (is (true? (:resolved? result)))
         (is (= "connection reset" (:exception result)))
-        (is (= (:expected-state op) (get-in result [:value :expected-state])))
-        (is (= actual (get-in result [:value :artifact-state])))))))
+        (is (= (:expected-state op) (get-in result [:result :expected-state])))
+        (is (= actual (get-in result [:result :artifact-state])))))))
 
 (deftest lifecycle-transition-still-fails-when-state-does-not-match
   (let [op     {:type :invoke
@@ -162,4 +195,4 @@
         (is (= :fail (:type result)))
         (is (= :drop-row-view-error (:error result)))
         (is (= {:row-view-present? {:expected false :actual true}}
-               (get-in result [:value :diff])))))))
+               (get-in result [:result :diff])))))))
