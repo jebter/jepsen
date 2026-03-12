@@ -76,6 +76,11 @@
                 true     (conj {:type :invoke :f :snapshot})))
             (range quiet-snapshot-count)))))
 
+(defn snapshot-result
+  [op]
+  (or (:result op)
+      (:value op)))
+
 (defn ambiguous-write-error?
   [t]
   (let [message (str (.getMessage t))]
@@ -101,7 +106,7 @@
       (try
         (let [row (mv/query-stored-row conn (get-in op [:value :id]))]
           (when (stored-row-matches? row (:value op))
-            (assoc op :type :ok :resolved? true :value (assoc (:value op) :verify :read-back))))
+            (assoc op :type :ok :resolved? true :result {:verify :read-back})))
         (finally
           (c/close! conn))))
     (catch Throwable _
@@ -185,8 +190,8 @@
 (defn ordered-snapshot-ops
   [snapshots]
   (->> snapshots
-       (sort-by (juxt #(get-in % [:value :snapshot-at-ms])
-                      #(get-in % [:value :snapshot-node])
+       (sort-by (juxt #(get (snapshot-result %) :snapshot-at-ms)
+                      #(get (snapshot-result %) :snapshot-node)
                       :process
                       :time))
        vec))
@@ -194,13 +199,13 @@
 (defn snapshots-by-node
   [snapshots]
   (->> (ordered-snapshot-ops snapshots)
-       (group-by #(get-in % [:value :snapshot-node]))
+       (group-by #(get (snapshot-result %) :snapshot-node))
        (into (sorted-map))))
 
 (defn stable-pair?
   [[a b]]
-  (let [av (:value a)
-        bv (:value b)]
+  (let [av (snapshot-result a)
+        bv (snapshot-result b)]
     (and av bv
          (:row-equal? av)
          (:agg-equal? av)
@@ -218,7 +223,7 @@
 (defn- purge-progress-state
   [snapshot-ops]
   (let [counts (->> snapshot-ops
-                    (map :value)
+                    (map snapshot-result)
                     (map :log-row-count)
                     (filter some?))]
     (cond
@@ -270,7 +275,7 @@
 
       :snapshot
       (try
-        (assoc op :type :ok :value (snapshot-state node conn @schedule-meta))
+        (assoc op :type :ok :result (snapshot-state node conn @schedule-meta))
         (catch Throwable t
           (assoc op :type :fail :error :snapshot-error :exception (.getMessage t))))
 
@@ -293,12 +298,12 @@
             snapshot-failures    (filter op/fail? snapshot-ops)
             ok-snapshots         (ordered-snapshot-ops (filter op/ok? snapshot-ops))
             stable-pair          (stable-pair-present? ok-snapshots)
-            refresh-progress?    (some #(let [value (:value %)]
+            refresh-progress?    (some #(let [value (snapshot-result %)]
                                           (and (:row-equal? value) (:agg-equal? value)))
                                        ok-snapshots)
             purge-progress-state (purge-progress ok-snapshots)
             purge-progress-ok?   (not= false purge-progress-state)
-            snapshot-values      (mapv :value ok-snapshots)]
+            snapshot-values      (mapv snapshot-result ok-snapshots)]
         (let [summary {:valid?                    (and (empty? unresolved-writes)
                                                        (empty? snapshot-failures)
                                                        (boolean stable-pair)
@@ -315,7 +320,7 @@
                        :summary-path              "mv-autosched/summary.edn"
                        :summary-json-path         "mv-autosched/summary.json"
                        :first-snapshot-failure    (first snapshot-failures)
-                       :last-snapshot             (some-> ok-snapshots last :value)
+                       :last-snapshot             (some-> ok-snapshots last snapshot-result)
                        :first-unresolved-write    (first unresolved-writes)}]
           (when (and (:name test) (:start-time test))
             (artifact/write-edn+json! test ["mv-autosched" "snapshots.edn"] snapshot-values)

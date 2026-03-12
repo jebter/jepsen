@@ -449,6 +449,34 @@
       (str "http://download.pingcap.org/tidb-" (:version test)
            "-linux-amd64.tar.gz")))
 
+(defn directory?
+  [path]
+  (try
+    (c/exec :test :-d path)
+    true
+    (catch RuntimeException _ false)))
+
+(defn ensure-bin-layout!
+  "Normalizes devbuild tarballs so /opt/tidb is always a directory and
+  /opt/tidb/bin always exists before component override tarballs are applied."
+  []
+  (when (and (cu/exists? tidb-dir)
+             (not (directory? tidb-dir)))
+    (info "Normalizing single-file TiDB tarball layout")
+    (let [root-bin (str tidb-dir ".root-bin")]
+      (c/exec :mv tidb-dir root-bin)
+      (c/exec :mkdir :-p tidb-dir)
+      (c/exec :mv root-bin (str tidb-dir "/" db-bin))))
+  ; Some tarballs place binaries directly in tidb-dir instead of tidb/bin.
+  ; Ensure a consistent ./bin layout before applying component overrides.
+  (when (not (cu/exists? tidb-bin-dir))
+    (info "Creating bin layout for TiDB tarball")
+    (c/exec :mkdir :-p tidb-bin-dir)
+    (doseq [b [pd-bin kv-bin db-bin pdctl-bin]]
+      (when (cu/exists? (str tidb-dir "/" b))
+        (c/exec :ln :-sf (str tidb-dir "/" b)
+                (str tidb-bin-dir "/" b))))))
+
 ; (defn setup-faketime!
 ;   "Configures the faketime wrapper for this node, so that the given binary runs
 ;   at the given rate."
@@ -471,19 +499,11 @@
       (info node "installing TiDB")
       (info (tarball-url test))
       (cu/install-archive! (tarball-url test) tidb-dir)
+      (ensure-bin-layout!)
       (doseq [url (:binary-urls test)]
         (info "Downloading additional binary from" url)
         (let [f (cu/cached-wget! url)]
           (c/exec :tar :-xf f :-C tidb-bin-dir)))
-      ; Some tarballs place binaries directly in tidb-dir instead of tidb/bin.
-      ; Ensure a consistent ./bin layout by creating symlinks when needed.
-      (when (not (cu/exists? tidb-bin-dir))
-        (info "Creating bin layout for TiDB tarball")
-        (c/exec :mkdir :-p tidb-bin-dir)
-        (doseq [b [pd-bin kv-bin db-bin pdctl-bin]]
-          (when (cu/exists? (str tidb-dir "/" b))
-            (c/exec :ln :-sf (str tidb-dir "/" b)
-                    (str tidb-bin-dir "/" b)))))
       (when (:pd-services test)
         (info "Creating symbol links for PD services")
         (doseq [[_ info] pd-services]

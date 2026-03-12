@@ -143,9 +143,9 @@
         (if (seq diff)
           (assoc op :type :fail
                     :error :artifact-state-mismatch
-                    :value (transition-value expected actual diff))
+                    :result (transition-value expected actual diff))
           (assoc op :type :ok
-                    :value (transition-value expected actual diff))))
+                    :result (transition-value expected actual diff))))
       (catch Throwable t
         (let [actual (try
                        (mv/artifact-state conn)
@@ -159,16 +159,11 @@
             (assoc op :type :ok
                       :resolved? true
                       :exception (.getMessage t)
-                      :value value)
+                      :result value)
             (assoc op :type :fail
                       :error (keyword (str (name (:f op)) "-error"))
                       :exception (.getMessage t)
-                      :value value)))))))
-
-(defn- completed-op?
-  [op]
-  (or (op/ok? op)
-      (op/fail? op)))
+                      :result value)))))))
 
 (defrecord MVLifecycleClient [conn node schema-created?]
   client/Client
@@ -217,7 +212,7 @@
                            (stateful/compare-row! conn test (or (:value op)
                                                                 (stateful/key-for-process (:process op)))))
               {:keys [type value]} comparison]
-          (assoc op :type type :value value))
+          (assoc op :type type :result value))
         (catch Throwable t
           (assoc op :type :fail :error :refresh-row-error :exception (.getMessage t))))
 
@@ -225,13 +220,13 @@
       (try
         (mv/refresh-view! conn mv/agg-view)
         (let [{:keys [type value]} (stateful/compare-agg! conn test)]
-          (assoc op :type type :value value))
+          (assoc op :type type :result value))
         (catch Throwable t
           (assoc op :type :fail :error :refresh-agg-error :exception (.getMessage t))))
 
       :purge
       (try
-        (assoc op :type :ok :value {:statement (mv/purge-log! conn)})
+        (assoc op :type :ok :result {:statement (mv/purge-log! conn)})
         (catch Throwable t
           (assoc op :type :fail :error :purge-error :exception (.getMessage t))))
 
@@ -247,16 +242,16 @@
   (reify checker/Checker
     (check [_ test history _]
       (let [refresh-row-ops      (filter #(and (= :refresh-row (:f %))
-                                               (completed-op? %))
+                                               (stateful/completed-op? %))
                                          history)
             refresh-agg-ops      (filter #(and (= :refresh-agg (:f %))
-                                               (completed-op? %))
+                                               (stateful/completed-op? %))
                                          history)
             purge-ops            (filter #(and (= :purge (:f %))
-                                               (completed-op? %))
+                                               (stateful/completed-op? %))
                                          history)
             lifecycle-ops        (filter #(and (:lifecycle-phase %)
-                                               (completed-op? %))
+                                               (stateful/completed-op? %))
                                          history)
             refresh-purge        (concat refresh-row-ops refresh-agg-ops purge-ops)
             recent-rp            (vec (take-last 20 refresh-purge))
@@ -269,8 +264,8 @@
             lifecycle-complete?  (= (count lifecycle-ops) (count management-ops))
             first-failure        (first failures)
             first-lifecycle-fail (first (filter op/fail? lifecycle-ops))
-            final-row-check      (some-> refresh-row-ops last :value)
-            final-agg-check      (some-> refresh-agg-ops last :value)
+            final-row-check      (some-> refresh-row-ops last stateful/op-result)
+            final-agg-check      (some-> refresh-agg-ops last stateful/op-result)
             lifecycle-history    (vec lifecycle-ops)
             summary              {:valid?                        (and lifecycle-complete?
                                                                         (empty? failures)
@@ -319,8 +314,9 @@
    :generator       (gen/stagger 1/5 (generator))
    :checker         (checker/compose {:mv-lifecycle (checker*)
                                       :timeline     (timeline/html)})
-   :final-generator (gen/seq [{:type :invoke, :f :refresh-row, :value :all}
-                              {:type :invoke, :f :refresh-agg}
-                              {:type :invoke, :f :purge}
-                              {:type :invoke, :f :refresh-row, :value :all}
-                              {:type :invoke, :f :refresh-agg}])})
+   :final-generator (gen/on #{0}
+                            (gen/seq [{:type :invoke, :f :refresh-row, :value :all}
+                                      {:type :invoke, :f :refresh-agg}
+                                      {:type :invoke, :f :purge}
+                                      {:type :invoke, :f :refresh-row, :value :all}
+                                      {:type :invoke, :f :refresh-agg}]))})
