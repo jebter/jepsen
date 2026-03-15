@@ -382,7 +382,8 @@
   operations."
   [n]
   (->> (cond-> []
-         (:clock-skew n)      (conj :reset-clock)
+         (:clock-skew n)      (conj (fn [test _]
+                                      (op :reset-clock (:nodes test))))
          (:pause-pd n)        (conj :resume-pd)
          (:pause-kv n)        (conj :resume-kv)
          (:pause-db n)        (conj :resume-db)
@@ -401,7 +402,9 @@
          (conj :disable-failpoint)
          (some n [:partition-one :partition-half :partition-ring])
          (conj :stop-partition))
-       (map op)
+       (map #(if (keyword? %)
+               (op %)
+               %))
        gen/seq))
 
 (defn restart-kv-without-pd-generator

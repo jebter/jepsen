@@ -140,6 +140,29 @@
   [op]
   (contains? clock-op-fns (:f op)))
 
+(defn- successful-clock-op?
+  [op]
+  (and (clock-op? op)
+       (contains? op :clock-offsets)))
+
+(defn- ok-snapshot-op?
+  [op]
+  (and (= :snapshot (:f op))
+       (op/ok? op)))
+
+(defn- post-reset-snapshots
+  [history]
+  (if-let [last-reset-idx (last (keep-indexed (fn [idx op]
+                                                (when (and (= :reset-clock (:f op))
+                                                           (contains? op :clock-offsets))
+                                                  idx))
+                                              history))]
+    (->> (drop (inc last-reset-idx) history)
+         (filter ok-snapshot-op?)
+         (map autosched/snapshot-result)
+         ordered-snapshots)
+    []))
+
 (defn flatten-offsets
   [clock-ops]
   (->> clock-ops
@@ -299,6 +322,199 @@
                           :first-disappearance  (earliest-event (map :first-disappearance node-summaries))
                           :by-node              by-node}])))))
 
+(def runtime-row-summary-keys
+  [:component
+   :object
+   :system-table
+   :object-id
+   :info-present?
+   :next-time-ms
+   :next-time-present?
+   :last-success-read-tso
+   :last-purged-tso
+   :id
+   :timer-key
+   :hook-class
+   :sched-policy-type
+   :sched-policy-expr
+   :enable?
+   :event-status
+   :event-id
+   :event-start
+   :watermark
+   :update-time
+   :matched-tokens
+   :matched-components
+   :error])
+
+(def runtime-sample-row-summary-keys
+  [:component
+   :object
+   :system-table
+   :object-id
+   :info-present?
+   :next-time-ms
+   :next-time-present?
+   :last-success-read-tso
+   :last-purged-tso
+   :id
+   :timer-key
+   :hook-class
+   :sched-policy-type
+   :sched-policy-expr
+   :enable?
+   :event-status
+   :event-id
+   :event-start
+   :watermark
+   :update-time])
+
+(defn runtime-observations
+  [snapshots]
+  (->> snapshots
+       (keep (fn [snapshot]
+               (when-let [entry (or (:runtime-metadata snapshot)
+                                    (:timer-metadata snapshot))]
+                 {:snapshot-at-ms     (:snapshot-at-ms snapshot)
+                  :snapshot-node      (:snapshot-node snapshot)
+                  :available?         (:available? entry)
+                  :source             (:source entry)
+                  :tables             (:tables entry)
+                  :table              (:table entry)
+                  :total-count        (:total-count entry)
+                  :match-count        (:match-count entry)
+                  :matched?           (pos? (long (or (:match-count entry) 0)))
+                  :rows               (mapv #(select-keys % runtime-row-summary-keys)
+                                            (:rows entry))
+                  :sample-rows        (mapv #(select-keys % runtime-sample-row-summary-keys)
+                                            (:sample-rows entry))
+                  :missing-components (vec (or (:missing-components entry) []))
+                  :error              (:error entry)})))
+       vec))
+
+(def timer-observations runtime-observations)
+
+(defn- runtime-event-status-counts
+  [observations]
+  (->> observations
+       (mapcat :rows)
+       (map :event-status)
+       (remove nil?)
+       frequencies
+       (into (sorted-map))))
+
+(defn- observation-present-components
+  [observation]
+  (->> (:rows observation)
+       (mapcat (fn [row]
+                 (cond
+                   (= :system-tables (:source observation))
+                   (when (:info-present? row)
+                     [(:component row)])
+
+                   :else
+                   (:matched-components row))))
+       (remove nil?)))
+
+(defn- runtime-component-counts
+  [observations]
+  (->> observations
+       (mapcat observation-present-components)
+       frequencies
+       (into (sorted-map))))
+
+(defn- runtime-missing-component-counts
+  [observations]
+  (->> observations
+       (mapcat :missing-components)
+       frequencies
+       (into (sorted-map))))
+
+(defn- summarize-runtime-observations
+  [observations]
+  (let [observations      (->> observations
+                               (sort-by (juxt :snapshot-at-ms :snapshot-node))
+                               vec)
+        available-count   (count (filter :available? observations))
+        matched-count     (count (filter :matched? observations))
+        first-available   (first (filter :available? observations))
+        first-match       (first (filter :matched? observations))
+        latest-match      (last (filter :matched? observations))
+        first-error       (first (filter #(and (false? (:available? %))
+                                               (:error %))
+                                         observations))
+        first-missing     (first (filter #(seq (:missing-components %))
+                                         observations))]
+    {:observation-count          (count observations)
+     :available-count            available-count
+     :matched-observation-count  matched-count
+     :fully-unavailable?         (and (seq observations)
+                                      (zero? available-count))
+     :ever-matched?              (pos? matched-count)
+     :first-available            first-available
+     :first-match                first-match
+     :latest-match               latest-match
+     :first-error                first-error
+     :first-missing-components   first-missing
+     :max-match-count            (reduce max 0 (map #(long (or (:match-count %) 0)) observations))
+     :sources                    (->> observations
+                                      (map :source)
+                                      (remove nil?)
+                                      distinct
+                                      sort
+                                      vec)
+     :present-component-counts   (runtime-component-counts observations)
+     :missing-component-counts   (runtime-missing-component-counts observations)
+     :event-status-counts        (runtime-event-status-counts observations)}))
+
+(defn runtime-metadata-summary
+  [snapshots]
+  (let [series-by-node (->> (snapshots-by-node snapshots)
+                            (into (sorted-map)
+                                  (map (fn [[node node-snapshots]]
+                                         [node (runtime-observations node-snapshots)]))))
+        by-node        (into (sorted-map)
+                             (map (fn [[node observations]]
+                                    [node (summarize-runtime-observations observations)]))
+                             series-by-node)
+        node-summaries (vals by-node)]
+    {:observation-count          (reduce + 0 (map :observation-count node-summaries))
+     :available-count            (reduce + 0 (map :available-count node-summaries))
+     :matched-observation-count  (reduce + 0 (map :matched-observation-count node-summaries))
+     :fully-unavailable?         (and (seq node-summaries)
+                                      (every? :fully-unavailable? node-summaries))
+     :ever-matched?              (boolean (some :ever-matched? node-summaries))
+     :first-available            (earliest-event (map :first-available node-summaries))
+     :first-match                (earliest-event (map :first-match node-summaries))
+     :latest-match               (->> node-summaries
+                                      (map :latest-match)
+                                      (remove nil?)
+                                      (sort-by (juxt :snapshot-at-ms :snapshot-node))
+                                      last)
+     :first-error                (earliest-event (map :first-error node-summaries))
+     :first-missing-components   (earliest-event (map :first-missing-components node-summaries))
+     :max-match-count            (reduce max 0 (map :max-match-count node-summaries))
+     :sources                    (->> node-summaries
+                                      (mapcat :sources)
+                                      distinct
+                                      sort
+                                      vec)
+     :present-component-counts   (reduce (fn [counts per-node]
+                                           (merge-with + counts per-node))
+                                         (sorted-map)
+                                         (map :present-component-counts node-summaries))
+     :missing-component-counts   (reduce (fn [counts per-node]
+                                           (merge-with + counts per-node))
+                                         (sorted-map)
+                                         (map :missing-component-counts node-summaries))
+     :event-status-counts        (reduce (fn [counts per-node]
+                                           (merge-with + counts per-node))
+                                         (sorted-map)
+                                         (map :event-status-counts node-summaries))
+     :by-node                    by-node}))
+
+(def timer-metadata-summary runtime-metadata-summary)
+
 (defn anomaly
   ([kind severity message]
    (anomaly kind severity message nil))
@@ -357,17 +573,16 @@
 
 (defn time-analysis
   [test history snapshots]
-  (let [snapshots                  (ordered-snapshots snapshots)
+  (let [requested?                 (boolean (:clock-skew (or (:nemesis-spec test) {})))
+        snapshots                  (ordered-snapshots snapshots)
         snapshot-series            (snapshots-by-node snapshots)
         node-analysis              (into (sorted-map)
                                         (for [[node node-snapshots] snapshot-series]
                                           [node (analyze-snapshot-series node-snapshots)]))
         node-summaries             (vals node-analysis)
         clock-ops                  (->> history
-                                        (filter clock-op?)
-                                        (filter :clock-offsets)
+                                        (filter successful-clock-op?)
                                         (mapv #(select-keys % [:time :process :type :f :value :clock-offsets])))
-        requested?                 (boolean (:clock-skew (or (:nemesis-spec test) {})))
         skew-ops                   (filterv #(contains? skew-op-fns (:f %)) clock-ops)
         reset-ops                  (filterv #(= :reset-clock (:f %)) clock-ops)
         first-converged-lag-ms     (max-some (map :first-converged-lag-ms node-summaries))
@@ -384,6 +599,7 @@
                                               :first-regression (first events)}))
                                          node-analysis)
         metadata-summary           (schedule-metadata-summary snapshots)
+        runtime-summary            (runtime-metadata-summary snapshots)
         missing-convergence        (first-node-match node-analysis
                                                     #(and (nil? (:first-converged-idx %))
                                                           (>= (:quiet-window-ms %) (convergence-budget-ms))))
@@ -514,6 +730,27 @@
                    :warning
                    "some schedule metadata could not be read via SHOW CREATE during quiet phase"
                    {:metadata-summary metadata-summary}))
+        runtime-metadata-unavailable-warning
+        (when (:fully-unavailable? runtime-summary)
+          (anomaly :runtime-metadata-unavailable
+                   :warning
+                   "MV runtime metadata could not be read during quiet phase"
+                   {:runtime-metadata runtime-summary}))
+        runtime-metadata-missing-warning
+        (when-let [event (:first-missing-components runtime-summary)]
+          (anomaly :runtime-metadata-missing-components
+                   :warning
+                   "some MV runtime metadata rows were missing from the schedule state tables during quiet phase"
+                   {:event event
+                    :runtime-metadata runtime-summary}))
+        runtime-metadata-unmatched-warning
+        (when (and (some #{:timers} (:sources runtime-summary))
+                   (pos? (:available-count runtime-summary))
+                   (not (:ever-matched? runtime-summary)))
+          (anomaly :runtime-metadata-unmatched
+                   :warning
+                   "fallback mysql.tidb_timers was readable but no rows matched the MV object names"
+                   {:runtime-metadata runtime-summary}))
         clause-unverified-warning  (first-best-effort-clause-missing-warning metadata-summary)
         hard-anomalies             (cond-> []
                                      (and requested? (empty? clock-ops))
@@ -580,6 +817,15 @@
                                      schedule-metadata-unavailable-warning
                                      (conj schedule-metadata-unavailable-warning)
 
+                                     runtime-metadata-unavailable-warning
+                                     (conj runtime-metadata-unavailable-warning)
+
+                                     runtime-metadata-missing-warning
+                                     (conj runtime-metadata-missing-warning)
+
+                                     runtime-metadata-unmatched-warning
+                                     (conj runtime-metadata-unmatched-warning)
+
                                      clause-unverified-warning
                                      (conj clause-unverified-warning))]
     {:warning                  skeleton-warning
@@ -600,6 +846,7 @@
      :snapshot-analysis-by-node node-analysis
      :snapshot-offset-summary  residual-offsets
      :schedule-metadata        metadata-summary
+     :runtime-metadata         runtime-summary
      :clock-events             clock-ops
      :clock-summary            (offset-summary clock-ops)
      :purge-progress           purge-state
@@ -612,11 +859,18 @@
   []
   (reify checker/Checker
     (check [_ test history _]
-      (let [snapshot-values (->> history
-                                 (filter #(and (= :snapshot (:f %))
-                                               (op/ok? %)))
-                                 (mapv autosched/snapshot-result))
-            analysis        (time-analysis test history snapshot-values)
+      (let [requested?              (boolean (:clock-skew (or (:nemesis-spec test) {})))
+            snapshot-values         (->> history
+                                         (filter #(and (= :snapshot (:f %))
+                                                       (op/ok? %)))
+                                         (mapv autosched/snapshot-result))
+            analysis-snapshot-values (if requested?
+                                      (post-reset-snapshots history)
+                                      (ordered-snapshots snapshot-values))
+            analysis                (assoc (time-analysis test history analysis-snapshot-values)
+                                      :raw-snapshot-count (count snapshot-values)
+                                      :ignored-pre-reset-snapshot-count (- (count snapshot-values)
+                                                                           (count analysis-snapshot-values)))
             anomalies       (:anomalies analysis)
             warnings        (:warnings analysis)]
         (let [summary {:valid?                   (empty? anomalies)
@@ -625,6 +879,8 @@
                        :clock-skew-supported?    true
                        :clock-skew-requested?    (:clock-skew-requested? analysis)
                        :snapshot-count           (:snapshot-count analysis)
+                       :raw-snapshot-count       (:raw-snapshot-count analysis)
+                       :ignored-pre-reset-snapshot-count (:ignored-pre-reset-snapshot-count analysis)
                        :converged-snapshot-count (:converged-snapshot-count analysis)
                        :quiet-window-ms          (:quiet-window-ms analysis)
                        :first-converged-lag-ms   (:first-converged-lag-ms analysis)
@@ -632,6 +888,8 @@
                        :purge-progress           (:purge-progress analysis)
                        :anomaly-count            (count anomalies)
                        :warning-count            (count warnings)
+                       :anomalies                anomalies
+                       :warnings                 warnings
                        :first-anomaly            (first anomalies)
                        :first-warning            (first warnings)
                        :analysis-path            analysis-path
