@@ -5,6 +5,9 @@ import argparse
 import shlex
 import sys
 import subprocess
+from collections import OrderedDict
+
+import mview_case_catalog
 
 
 def shell_quote(value):
@@ -55,7 +58,7 @@ def all_nemesis():
     return nemesis
 
 
-def workload_options():
+def non_mview_workload_options():
     return {
         "append": ["",
                    "--predicate-read=true",
@@ -68,9 +71,6 @@ def workload_options():
                             "--update-in-place=true",
                             "--read-lock=update --update-in-place=true",
                             "--read-lock=update --update-in-place=false"],
-        "mv-lifecycle": [""],
-        "mv-autosched": [""],
-        "mv-stateful": [""],
         # "long-fork": ["--use-index=true", "--use-index=false"],
         # "monotonic": ["--use-index=true", "--use-index=false"],
         "register": ["",
@@ -84,12 +84,9 @@ def workload_options():
     }
 
 
-def workload_options_for_pessimistic_txn():
+def non_mview_workload_options_for_pessimistic_txn():
     return {
         "bank": ["--read-lock=update"],
-        "mv-lifecycle": [""],
-        "mv-autosched": [""],
-        "mv-stateful": [""],
         "bank-multitable": ["--read-lock=update --update-in-place=true",
                             "--read-lock=update --update-in-place=false"],
         "register": ["--read-lock=update --use-index=true",
@@ -102,6 +99,43 @@ def workload_options_for_pessimistic_txn():
 def workload_options_for_mixed_txn():
     # I'm not sure which tests can be passed, so use pessimistic transaction tests first.
     return workload_options_for_pessimistic_txn()
+
+
+def mview_workload_options():
+    return OrderedDict((workload, [""]) for workload in mview_case_catalog.active_mview_workloads())
+
+
+def workload_options():
+    workloads = OrderedDict(non_mview_workload_options())
+    workloads.update(mview_workload_options())
+    return workloads
+
+
+def workload_options_for_pessimistic_txn():
+    workloads = OrderedDict(non_mview_workload_options_for_pessimistic_txn())
+    workloads.update(mview_workload_options())
+    return workloads
+
+
+def mview_cases_by_workload():
+    cases = OrderedDict((workload, []) for workload in mview_case_catalog.active_mview_workloads())
+    for case in mview_case_catalog.active_mview_cases():
+        cases.setdefault(case["workload"], []).append(case)
+    return cases
+
+
+def build_test_command(workload, option, nemesis, time_limit, version, tarball, txn_mode, follower_c, extra_build):
+    return (
+        "lein run test --workload=" + shell_quote(workload) +
+        " --time-limit=" + str(time_limit) +
+        " --concurrency 2n" +
+        " --auto-retry=default --auto-retry-limit=default" +
+        " --version=" + shell_quote(version) +
+        " --tarball-url=" + shell_quote(tarball) + extra_build +
+        " --nemesis=" + shell_quote(nemesis) + " " + option +
+        " --ssh-private-key /root/.ssh/id_rsa" +
+        " --txn-mode=" + shell_quote(txn_mode) + follower_c
+    )
 
 
 def gen_tests(version, tarball, time_limit, txn_mode, follower_read, binary_urls="", build_branch="", build_commit_sha="", build_time="", feature_flags="", build_notes=""):
@@ -120,16 +154,36 @@ def gen_tests(version, tarball, time_limit, txn_mode, follower_read, binary_urls
     extra_build = build_extra_args(binary_urls, build_branch, build_commit_sha, build_time, feature_flags, build_notes)
 
     tests = []
+    mview_cases = mview_cases_by_workload()
     for w in workloads:
         for option in workloads[w]:
-            for ne in nemesis:
-                tests.append("lein run test --workload=" + shell_quote(w) + " --time-limit=" + str(time_limit) + " --concurrency 2n" +
-                             " --auto-retry=default --auto-retry-limit=default" +
-                             " --version=" + shell_quote(version) + " --tarball-url=" + shell_quote(tarball) + extra_build +
-                             " --nemesis=" + shell_quote(ne) + " " + option + " --ssh-private-key /root/.ssh/id_rsa" +
-                             " --txn-mode=" + shell_quote(txn_mode) + follower_c)
+            if w in mview_cases:
+                for case in mview_cases[w]:
+                    tests.append(build_test_command(
+                        workload=w,
+                        option=option,
+                        nemesis=case["nemesis"],
+                        time_limit=case["time_limit"],
+                        version=version,
+                        tarball=tarball,
+                        txn_mode=txn_mode,
+                        follower_c=follower_c,
+                        extra_build=extra_build,
+                    ))
+            else:
+                for ne in nemesis:
+                    tests.append(build_test_command(
+                        workload=w,
+                        option=option,
+                        nemesis=ne,
+                        time_limit=time_limit,
+                        version=version,
+                        tarball=tarball,
+                        txn_mode=txn_mode,
+                        follower_c=follower_c,
+                        extra_build=extra_build,
+                    ))
 
-    tests.sort()
     return tests
 
 

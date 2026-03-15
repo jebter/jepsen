@@ -1,0 +1,349 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "workload": "mv-stateful",
+      "nemesis": "none",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 300,
+      "reason": "smoke semantic validation baseline"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "kill-db",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke TiDB-only process fault"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "pause-db",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke TiDB-only pause fault"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "partition",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke network partition fault"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "none",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 300,
+      "reason": "smoke lifecycle rebuild baseline"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "kill-db",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke TiDB-only lifecycle fault"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "pause-db",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke TiDB-only lifecycle pause fault"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "partition",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "smoke lifecycle network partition fault"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "none",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "smoke autosched convergence baseline"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "kill-db",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "smoke autosched TiDB-only process fault"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "partition",
+      "tier": "smoke",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "smoke autosched network partition fault"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "kill-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD kill coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "kill-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV kill coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "stop-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD stop coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "stop-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV stop coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "stop-db",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiDB stop coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "pause-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD pause coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "pause-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV pause coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "shuffle-leader",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule leader shuffle coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "shuffle-region",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule region shuffle coverage"
+    },
+    {
+      "workload": "mv-stateful",
+      "nemesis": "random-merge",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule random-merge coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "kill-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD kill coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "kill-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV kill coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "stop-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD stop coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "stop-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV stop coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "stop-db",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiDB stop coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "pause-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault PD pause coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "pause-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault TiKV pause coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "shuffle-leader",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule leader shuffle coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "shuffle-region",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule region shuffle coverage"
+    },
+    {
+      "workload": "mv-lifecycle",
+      "nemesis": "random-merge",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 600,
+      "reason": "single-fault schedule random-merge coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "kill-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault PD kill coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "kill-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault TiKV kill coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "stop-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault PD stop coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "stop-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault TiKV stop coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "stop-db",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault TiDB stop coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "pause-pd",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault PD pause coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "pause-kv",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault TiKV pause coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "pause-db",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault TiDB pause coverage beyond smoke suite"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "shuffle-leader",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault schedule leader shuffle coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "shuffle-region",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault schedule region shuffle coverage"
+    },
+    {
+      "workload": "mv-autosched",
+      "nemesis": "random-merge",
+      "tier": "full",
+      "status": "active",
+      "time_limit": 900,
+      "reason": "single-fault schedule random-merge coverage"
+    },
+    {
+      "workload": "mv-autosched-time",
+      "nemesis": "clock-skew",
+      "tier": "manual",
+      "status": "manual_only",
+      "time_limit": 900,
+      "reason": "experimental phase-2 schedule-time analysis remains manual-only"
+    }
+  ]
+}
