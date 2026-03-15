@@ -33,6 +33,13 @@ Primary bugs it should catch:
 - delete residue
 - refresh materializing an incorrect state
 
+Current checker contract:
+
+- final row refresh and final aggregate refresh remain the pass/fail oracle
+- active-phase row or aggregate failures are retained in the summary separately from final-phase checks
+- intermediate row or aggregate failures are retained in the summary, even if later explicit refreshes recover
+- the summary reports whether those failures recovered before the final oracle
+
 ### `mv-lifecycle`
 
 Use `mv-lifecycle` when the question is: after dropping and recreating row views, aggregate views, or the whole MLog + MV chain under live writes and faults, can explicit refresh rebuild the correct state from the current base table?
@@ -80,7 +87,7 @@ Current checker contract:
 
 - reuse `mv-autosched` data path and quiet-phase convergence checks
 - emit an extra time-analysis artifact under `mv-autosched-time/`
-- capture best-effort `SHOW CREATE` metadata for row refresh / agg refresh / log purge schedules; fallback `SHOW CREATE` results that omit `START WITH / NEXT` are warning-only unless native materialized-view DDL loses the clause
+- capture runtime schedule metadata for row refresh / agg refresh / log purge from `mysql.tidb_mview_refresh_info` and `mysql.tidb_mlog_purge_info`; if those system tables are unavailable, fall back to best-effort `SHOW CREATE` / legacy timer metadata and downgrade missing schedule evidence to warnings
 - require at least one real skew injection (`bump-clock` or `strobe-clock`) when `clock-skew` is requested
 - require a successful `reset-clock` before the quiet-phase oracle is considered valid
 - fail when post-reset convergence or post-reset stability exceeds the configured quiet-phase budgets
@@ -90,7 +97,7 @@ Current checker contract:
 Current limitation:
 
 - `clock-skew` is enabled for manual runs, but it is not yet part of the default gate suite
-- the checker now uses best-effort `SHOW CREATE` metadata as a direct schedule signal, but it still does not read a first-class `next_time` system table from TiDB
+- the checker treats `mysql.tidb_mview_refresh_info` / `mysql.tidb_mlog_purge_info` as the primary schedule signal, but it still keeps compatibility fallbacks for older builds that only expose legacy timer metadata
 
 ## Branch-build input model
 
@@ -158,25 +165,96 @@ Example:
 }
 ```
 
+## Suite layering and case catalog
+
+The MView suite matrix now comes from `scripts/mview_case_catalog.json`. Shell wrappers and `run_jepsen.py` should read this catalog instead of maintaining separate hand-written MView case lists.
+
+Each explicit catalog entry carries:
+
+- `workload`
+- `nemesis`
+- `tier`
+- `status`
+- `time_limit`
+- `reason`
+
+Status meanings:
+
+- `active`: included in the default full single-fault suite
+- `manual_only`: runnable manually, but excluded from default suites
+- `deferred`: reserved for future or intentionally excluded cases
+
+Current eligibility split:
+
+- `active`: `mv-stateful`, `mv-lifecycle`, and `mv-autosched` crossed with `none`, `kill-pd`, `kill-kv`, `kill-db`, `stop-pd`, `stop-kv`, `stop-db`, `pause-pd`, `pause-kv`, `pause-db`, `partition`, `shuffle-leader`, `shuffle-region`, and `random-merge`
+- `manual_only`: `mv-autosched-time` with `clock-skew`
+- `deferred`: all combination faults and any future single fault not yet assigned a default time limit in the catalog
+
+Suite definitions:
+
+- `branch-validation`: 11-case smoke suite for wiring, manifest, and report-chain regression checks
+- `full-single-fault`: 42-case exhaustive single-fault matrix across the 3 stable workloads
+- `autosched-longrun`: long-run `mv-autosched` stability suite
+
 ## Suggested execution order
 
-1. `mv-stateful` with `none`
-2. `mv-stateful` with `kill-db`
-3. `mv-stateful` with `pause-db`
-4. `mv-stateful` with `partition`
-5. `mv-lifecycle` with `none`
-6. `mv-lifecycle` with `kill-db`
-7. `mv-lifecycle` with `pause-db`
-8. `mv-lifecycle` with `partition`
-9. `mv-autosched` with `none`
-10. `mv-autosched` with `kill-db`
-11. `mv-autosched` with `partition`
+1. Run `branch-validation` first as the fast smoke gate.
+2. Run `full-single-fault` second to materialize the complete 42-case debug input.
+3. Keep `autosched-longrun` separate from the single-fault matrix.
+4. Keep `mv-autosched-time` on the manual path until it is promoted out of experimental status.
+
+Within `full-single-fault`, the default batch order is:
+
+1. `mv-stateful` with all 14 single faults
+2. `mv-lifecycle` with all 14 single faults
+3. `mv-autosched` with all 14 single faults
+
+Within each workload batch, the nemesis order is:
+
+1. `none`
+2. `kill-*`
+3. `stop-*`
+4. `pause-*`
+5. `partition`
+6. `shuffle-leader`, `shuffle-region`, `random-merge`
+
+## Debug batch flow
+
+When consuming `full-single-fault`, debug by workload rather than by nemesis:
+
+1. `mv-stateful`
+2. `mv-lifecycle`
+3. `mv-autosched`
+
+Stopping rules:
+
+- if a workload's `none` case fails, stop that workload batch immediately and fix the shared or workload-local baseline before retrying from `none`
+- if two different nemeses in the same workload fail with the same infra signature before the workload checker emits artifacts, stop that workload batch and fix the shared layer first
+- if the same infra signature reappears in a second workload, do not continue into the third workload until the shared layer is fixed
+
+Each workload batch should produce:
+
+- a `pass` case list
+- a `fail` case list
+- failure buckets grouped by signature
+- shared issues that cut across workloads
+- a clear continue/stop decision for the next batch
 
 Equivalent helper commands:
 
 ```bash
 scripts/mview_branch_validation.sh <tarball-url>
+scripts/mview_full_single_fault.sh <tarball-url>
+scripts/mview_suite_run_and_report.sh full-single-fault <tarball-url>
 TIME_LIMIT=21600 scripts/mview_autosched_longrun.sh <tarball-url>
+scripts/mview_autosched_time.sh <tarball-url>
+```
+
+To run a single workload batch from the catalog-driven suites, use `WORKLOAD_FILTER`:
+
+```bash
+WORKLOAD_FILTER=mv-stateful scripts/mview_full_single_fault.sh <tarball-url>
+WORKLOAD_FILTER=mv-lifecycle scripts/mview_suite_run_and_report.sh full-single-fault <tarball-url>
 ```
 
 ## Output checklist
@@ -200,6 +278,8 @@ Auto-emitted artifacts:
 - `mv-stateful/final-agg-check.edn`
 - `mv-stateful/recent-refresh-purge.edn`
 - `mv-stateful/first-failure.edn`
+- `mv-stateful/first-row-failure.edn`
+- `mv-stateful/first-agg-failure.edn`
 - `mv-lifecycle/final-row-check.edn`
 - `mv-lifecycle/final-agg-check.edn`
 - `mv-lifecycle/lifecycle-history.edn`
@@ -217,8 +297,10 @@ Auto-emitted artifacts:
 Helper scripts:
 
 - `scripts/mview_branch_validation.sh` runs the recommended branch gate matrix
+- `scripts/mview_full_single_fault.sh` runs the exhaustive 42-case single-fault suite
 - `scripts/mview_autosched_longrun.sh` runs the recommended autosched long-run matrix
 - `scripts/mview_autosched_time.sh` runs the experimental phase-2 skeleton
+- `scripts/mview_suite_run_and_report.sh` accepts `branch-validation`, `full-single-fault`, and `autosched-longrun`
 
 ## Next work
 

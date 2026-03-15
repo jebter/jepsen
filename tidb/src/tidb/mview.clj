@@ -7,10 +7,24 @@
 (def base-table "mv_stateful_base")
 (def row-view "mv_stateful_row")
 (def agg-view "mv_stateful_agg")
+(def timer-table "mysql.tidb_timers")
+(def mview-refresh-info-table "mysql.tidb_mview_refresh_info")
+(def mlog-purge-info-table "mysql.tidb_mlog_purge_info")
 (def refresh-lock-retry-count 5)
 (def refresh-lock-retry-ms 250)
 
 (declare try-statements!)
+
+(defn- schedule-timestamp-exprs
+  [seconds]
+  [(str "NOW(0) + INTERVAL " seconds " SECOND")
+   (str "(NOW() + INTERVAL " seconds " SECOND)")])
+
+(defn- schedule-clause-pairs
+  [start-delay next-seconds]
+  (map vector
+       (schedule-timestamp-exprs start-delay)
+       (schedule-timestamp-exprs next-seconds)))
 
 (defn execute-safely!
   ([conn stmt]
@@ -26,8 +40,8 @@
 
 (defn drop-artifacts!
   [conn]
-  (doseq [stmt [(str "DROP MATERIALIZED VIEW IF EXISTS " agg-view)
-                (str "DROP MATERIALIZED VIEW IF EXISTS " row-view)
+  (doseq [stmt [(str "DROP MATERIALIZED VIEW " agg-view)
+                (str "DROP MATERIALIZED VIEW " row-view)
                 (str "DROP MATERIALIZED VIEW LOG ON " base-table)
                 (str "DROP TABLE IF EXISTS " base-table)]]
     (execute-safely! conn stmt "Ignoring MV cleanup error:")))
@@ -66,13 +80,13 @@
 
 (defn drop-row-view!
   [conn]
-  (let [stmt (str "DROP MATERIALIZED VIEW IF EXISTS " row-view)]
+  (let [stmt (str "DROP MATERIALIZED VIEW " row-view)]
     (c/execute! conn [stmt])
     stmt))
 
 (defn drop-agg-view!
   [conn]
-  (let [stmt (str "DROP MATERIALIZED VIEW IF EXISTS " agg-view)]
+  (let [stmt (str "DROP MATERIALIZED VIEW " agg-view)]
     (c/execute! conn [stmt])
     stmt))
 
@@ -88,14 +102,17 @@
         (try-statements!
          conn
          (str "Create scheduled MLOG failed for " base-table)
-         [(str "CREATE MATERIALIZED VIEW LOG ON " base-table
-               " (id, g1, v1, version, last_token, deleted) "
-               "PURGE START WITH (NOW() + INTERVAL " start-delay " SECOND) "
-               "NEXT " next-seconds)
-          (str "CREATE MATERIALIZED VIEW LOG ON " base-table
-               " (id, g1, v1, version, last_token, deleted) "
-               "START WITH (NOW() + INTERVAL " start-delay " SECOND) "
-               "NEXT " next-seconds)])
+         (vec
+          (mapcat (fn [[start-expr next-expr]]
+                    [(str "CREATE MATERIALIZED VIEW LOG ON " base-table
+                          " (id, g1, v1, version, last_token, deleted) "
+                          "PURGE START WITH " start-expr " "
+                          "NEXT " next-expr)
+                     (str "CREATE MATERIALIZED VIEW LOG ON " base-table
+                          " (id, g1, v1, version, last_token, deleted) "
+                          "START WITH " start-expr " "
+                          "NEXT " next-expr)])
+                  (schedule-clause-pairs start-delay next-seconds))))
         (catch java.sql.SQLException _
           nil))
       (create-mlog! conn)))
@@ -198,20 +215,30 @@
   (try-statements!
    conn
    (str "Schedule refresh failed for " view)
-   [(str "ALTER MATERIALIZED VIEW " view
-         " REFRESH START WITH (NOW() + INTERVAL " start-delay " SECOND) NEXT " next-seconds)
-    (str "ALTER MATERIALIZED VIEW " view
-         " START WITH (NOW() + INTERVAL " start-delay " SECOND) NEXT " next-seconds)]))
+   (vec
+    (mapcat (fn [[start-expr next-expr]]
+              [(str "ALTER MATERIALIZED VIEW " view
+                    " REFRESH START WITH " start-expr
+                    " NEXT " next-expr)
+               (str "ALTER MATERIALIZED VIEW " view
+                    " START WITH " start-expr
+                    " NEXT " next-expr)])
+            (schedule-clause-pairs start-delay next-seconds)))))
 
 (defn schedule-purge!
   [conn start-delay next-seconds]
   (try-statements!
    conn
    (str "Schedule purge failed for " base-table)
-   [(str "ALTER MATERIALIZED VIEW LOG ON " base-table
-         " PURGE START WITH (NOW() + INTERVAL " start-delay " SECOND) NEXT " next-seconds)
-    (str "ALTER MATERIALIZED VIEW LOG ON " base-table
-         " START WITH (NOW() + INTERVAL " start-delay " SECOND) NEXT " next-seconds)]))
+   (vec
+    (mapcat (fn [[start-expr next-expr]]
+              [(str "ALTER MATERIALIZED VIEW LOG ON " base-table
+                    " PURGE START WITH " start-expr
+                    " NEXT " next-expr)
+               (str "ALTER MATERIALIZED VIEW LOG ON " base-table
+                    " START WITH " start-expr
+                    " NEXT " next-expr)])
+            (schedule-clause-pairs start-delay next-seconds)))))
 
 (defn list-table-names
   [conn]
@@ -221,10 +248,16 @@
        (remove nil?)
        set))
 
+(defn- mlog-table-name?
+  [table-name]
+  (and table-name
+       (str/starts-with? table-name "$mlog$")))
+
 (defn artifact-state
   [conn]
   (let [tables    (list-table-names conn)
-        log-table (first (sort (remove #{base-table row-view agg-view} tables)))]
+        log-table (first (sort (filter mlog-table-name?
+                                       (remove #{base-table row-view agg-view} tables))))]
     {:base-table-present? (contains? tables base-table)
      :row-view-present?   (contains? tables row-view)
      :agg-view-present?   (contains? tables agg-view)
@@ -277,17 +310,25 @@
 
 (defn- parse-next-literal
   [ddl]
-  (some->> ddl
-           (re-find #"(?i)\bNEXT\s+([0-9]+)")
-           second
-           Long/parseLong))
+  (or (some->> ddl
+               (re-find #"(?i)\bNEXT\s+([0-9]+)\b")
+               second
+               Long/parseLong)
+      (some->> ddl
+               (re-find #"(?i)\bNEXT\s+\(?\s*(?:NOW(?:\(\d*\))?\s*\+\s*)?INTERVAL\s+([0-9]+)\s+SECOND\b")
+               second
+               Long/parseLong)
+      (some->> ddl
+               (re-find #"(?i)\bNEXT\s+\(?\s*DATE_ADD\s*\(\s*NOW(?:\(\d*\))?\s*,\s*INTERVAL\s+([0-9]+)\s+SECOND\s*\)\s*\)?")
+               second
+               Long/parseLong)))
 
 (defn- ddl-schedule-summary
   [kind object-name expected-next-seconds observation]
   (let [ddl         (:ddl observation)
         ddl-upper   (some-> ddl str/upper-case)
         start-with? (boolean (and ddl-upper (str/includes? ddl-upper "START WITH")))
-        next?       (boolean (and ddl-upper (re-find #"\bNEXT\s+[0-9]+" ddl-upper)))
+        next?       (boolean (and ddl-upper (re-find #"\bNEXT\b" ddl-upper)))
         refresh?    (boolean (and ddl-upper (str/includes? ddl-upper "REFRESH")))
         purge?      (boolean (and ddl-upper (str/includes? ddl-upper "PURGE")))
         next-value  (parse-next-literal ddl)]
@@ -301,7 +342,7 @@
             :schedule-visible?      (and start-with? next?)
             :next-literal           next-value
             :expected-next-seconds  expected-next-seconds
-            :next-matches-expected? (when (and next-value expected-next-seconds)
+            :next-matches-expected? (when (and next? expected-next-seconds)
                                       (= next-value expected-next-seconds))})))
 
 (defn- read-view-schedule-metadata
@@ -329,6 +370,250 @@
   {:row-refresh (read-view-schedule-metadata conn row-view row-refresh-seconds)
    :agg-refresh (read-view-schedule-metadata conn agg-view agg-refresh-seconds)
    :log-purge   (read-log-schedule-metadata conn log-table purge-next-seconds)})
+
+(defn- ->long
+  [x]
+  (when (some? x)
+    (long x)))
+
+(defn- byte-array-value?
+  [x]
+  (= (class x) (Class/forName "[B")))
+
+(defn- printable-value
+  [x]
+  (cond
+    (nil? x) nil
+    (byte-array-value? x) (String. ^bytes x java.nio.charset.StandardCharsets/UTF_8)
+    :else (str x)))
+
+(defn- timer-match-fields
+  [row]
+  (->> [(:timer_key row)
+        (:hook_class row)
+        (:timer_ext row)
+        (:timer_data row)
+        (:summary_data row)
+        (:event_data row)]
+       (map printable-value)
+       (remove str/blank?)))
+
+(defn- timer-match-tokens
+  [{:keys [log-table]}]
+  (->> [row-view agg-view log-table base-table]
+       (remove str/blank?)
+       distinct
+       vec))
+
+(defn- matched-timer-tokens
+  [fields tokens]
+  (->> tokens
+       (filter (fn [token]
+                 (some #(str/includes? % token) fields)))
+       vec))
+
+(defn- classify-timer-match
+  [matched-tokens]
+  (cond-> []
+    (some #{row-view} matched-tokens) (conj :row-refresh)
+    (some #{agg-view} matched-tokens) (conj :agg-refresh)
+    (or (some #(or (= % base-table)
+                   (str/starts-with? % "$mlog$"))
+              matched-tokens)
+        (some #(str/starts-with? % "$mlog$")
+              matched-tokens))
+    (conj :log-purge)))
+
+(defn- normalize-timer-row
+  [row tokens]
+  (let [fields         (timer-match-fields row)
+        matched-tokens (matched-timer-tokens fields tokens)
+        event-status   (some-> (:event_status row) str/upper-case)]
+    {:id                (->long (:id row))
+     :namespace         (some-> (:namespace row) str)
+     :timer-key         (some-> (:timer_key row) str)
+     :time-zone         (some-> (:timezone row) str)
+     :sched-policy-type (some-> (:sched_policy_type row) str)
+     :sched-policy-expr (some-> (:sched_policy_expr row) str)
+     :hook-class        (some-> (:hook_class row) str)
+     :watermark         (printable-value (:watermark row))
+     :enable?           (boolean (and (some? (:enable row))
+                                      (not (zero? (long (:enable row))))))
+     :event-status      event-status
+     :event-id          (some-> (:event_id row) str)
+     :event-start       (printable-value (:event_start row))
+     :create-time       (printable-value (:create_time row))
+     :update-time       (printable-value (:update_time row))
+     :version           (->long (:version row))
+     :matched-tokens    matched-tokens
+     :matched-components (classify-timer-match matched-tokens)}))
+
+(defn read-timer-metadata
+  [conn schedule-meta]
+  (let [tokens (timer-match-tokens schedule-meta)]
+    (try
+      (let [rows         (c/query conn [(str "SELECT id, namespace, timer_key, timezone, "
+                                             "sched_policy_type, sched_policy_expr, hook_class, "
+                                             "watermark, enable, event_status, event_id, "
+                                             "event_start, create_time, update_time, version, "
+                                             "timer_ext, timer_data, summary_data, event_data "
+                                             "FROM " timer-table " ORDER BY id")])
+            normalized   (mapv #(normalize-timer-row % tokens) rows)
+            matched      (->> normalized
+                              (filter #(seq (:matched-tokens %)))
+                              vec)
+            sample-rows  (->> normalized
+                              (take 5)
+                              vec)]
+        {:available?     true
+         :source         :timers
+         :table          timer-table
+         :object-tokens  tokens
+         :total-count    (count normalized)
+         :match-count    (count matched)
+         :rows           matched
+         :sample-rows    (when (zero? (count matched))
+                           sample-rows)})
+      (catch java.sql.SQLException e
+        {:available?    false
+         :source        :timers
+         :table         timer-table
+         :object-tokens tokens
+         :error         (.getMessage e)}))))
+
+(defn- query-system-runtime-rows
+  [conn sql-prefix object-names]
+  (let [placeholders (str/join ", " (repeat (count object-names) "?"))
+        sql          (str sql-prefix
+                          " ("
+                          placeholders
+                          ") "
+                          "ORDER BY t.table_name")]
+    (c/query conn (into [sql] object-names))))
+
+(defn- query-refresh-runtime-rows
+  [conn object-names]
+  (when (seq object-names)
+    (query-system-runtime-rows
+     conn
+     (str "SELECT t.table_name AS object_name, "
+          "t.tidb_table_id AS object_id, "
+          "CASE WHEN i.mview_id IS NULL THEN 0 ELSE 1 END AS info_present, "
+          "CAST(ROUND(UNIX_TIMESTAMP(i.next_time) * 1000) AS SIGNED) AS next_time_ms, "
+          "i.last_success_read_tso AS last_success_read_tso "
+          "FROM information_schema.tables t "
+          "LEFT JOIN " mview-refresh-info-table " i ON i.mview_id = t.tidb_table_id "
+          "WHERE t.table_schema = DATABASE() AND t.table_name IN")
+     object-names)))
+
+(defn- query-purge-runtime-rows
+  [conn object-names]
+  (when (seq object-names)
+    (query-system-runtime-rows
+     conn
+     (str "SELECT t.table_name AS object_name, "
+          "t.tidb_table_id AS object_id, "
+          "CASE WHEN i.mlog_id IS NULL THEN 0 ELSE 1 END AS info_present, "
+          "CAST(ROUND(UNIX_TIMESTAMP(i.next_time) * 1000) AS SIGNED) AS next_time_ms, "
+          "i.last_purged_tso AS last_purged_tso "
+          "FROM information_schema.tables t "
+          "LEFT JOIN " mlog-purge-info-table " i ON i.mlog_id = t.tidb_table_id "
+          "WHERE t.table_schema = DATABASE() AND t.table_name IN")
+     object-names)))
+
+(defn- index-rows-by-object-name
+  [rows]
+  (into {}
+        (map (fn [row]
+               [(some-> (:object_name row) str) row]))
+        rows))
+
+(defn- info-present?
+  [row]
+  (boolean (and (some? (:info_present row))
+                (not (zero? (long (:info_present row)))))))
+
+(defn- runtime-row-base
+  [component object-name system-table row]
+  (let [info? (and row (info-present? row))]
+    {:component          component
+     :object             object-name
+     :system-table       system-table
+     :object-id          (some-> row :object_id ->long)
+     :info-present?      (boolean info?)
+     :next-time-ms       (some-> row :next_time_ms ->long)
+     :next-time-present? (some? (some-> row :next_time_ms ->long))
+     :matched-tokens     (if info? [object-name] [])
+     :matched-components (if info? [component] [])
+     :error              (when-not row
+                           "object not found in information_schema.tables")}))
+
+(defn- normalize-refresh-runtime-row
+  [component object-name row]
+  (assoc (runtime-row-base component object-name mview-refresh-info-table row)
+         :last-success-read-tso (some-> row :last_success_read_tso ->long)))
+
+(defn- normalize-purge-runtime-row
+  [object-name row]
+  (assoc (runtime-row-base :log-purge object-name mlog-purge-info-table row)
+         :last-purged-tso (some-> row :last_purged_tso ->long)))
+
+(defn- read-system-runtime-metadata
+  [conn {:keys [log-table]}]
+  (try
+    (let [refresh-rows      (query-refresh-runtime-rows conn [row-view agg-view])
+          refresh-by-object (index-rows-by-object-name refresh-rows)
+          purge-by-object   (when log-table
+                              (-> (query-purge-runtime-rows conn [log-table])
+                                  index-rows-by-object-name))
+          rows              (cond-> [(normalize-refresh-runtime-row :row-refresh
+                                                                    row-view
+                                                                    (get refresh-by-object row-view))
+                                     (normalize-refresh-runtime-row :agg-refresh
+                                                                    agg-view
+                                                                    (get refresh-by-object agg-view))]
+                              log-table
+                              (conj (normalize-purge-runtime-row log-table
+                                                                 (get purge-by-object log-table))))
+          missing-components (->> rows
+                                  (remove :info-present?)
+                                  (map :component)
+                                  vec)]
+      {:available?          true
+       :source              :system-tables
+       :tables              (cond-> [mview-refresh-info-table]
+                              log-table (conj mlog-purge-info-table))
+       :expected-components (mapv :component rows)
+       :match-count         (count (filter :info-present? rows))
+       :rows                rows
+       :missing-components  missing-components})
+    (catch java.sql.SQLException e
+      {:available? false
+       :source    :system-tables
+       :tables    (cond-> [mview-refresh-info-table]
+                    log-table (conj mlog-purge-info-table))
+       :error     (.getMessage e)})))
+
+(defn read-runtime-metadata
+  [conn schedule-meta]
+  (let [system-metadata (read-system-runtime-metadata conn schedule-meta)]
+    (if (:available? system-metadata)
+      system-metadata
+      (let [timer-metadata (read-timer-metadata conn schedule-meta)]
+        (if (:available? timer-metadata)
+          (assoc timer-metadata
+                 :fallback-source :system-tables
+                 :fallback-error  (:error system-metadata))
+          {:available?    false
+           :source        :unavailable
+           :tables        (vec (concat (:tables system-metadata)
+                                       [timer-table]))
+           :error         (str/join " | "
+                                    (remove str/blank?
+                                            [(:error system-metadata)
+                                             (:error timer-metadata)]))
+           :probe-errors  {:system-tables (:error system-metadata)
+                           :timers        (:error timer-metadata)}})))))
 
 (defn normalize-base-row
   [row]

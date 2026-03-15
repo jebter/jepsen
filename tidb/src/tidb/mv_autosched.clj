@@ -1,6 +1,7 @@
 (ns tidb.mv-autosched
   (:refer-clojure :exclude [test])
   (:require [clojure.pprint :refer [pprint]]
+            [clojure.string :as str]
             [jepsen
              [checker :as checker]
              [client :as client]
@@ -68,13 +69,16 @@
 
 (defn quiet-generator
   []
-  (gen/seq
-   (vec
-    (mapcat (fn [i]
-              (cond-> []
-                (pos? i) (conj (gen/sleep quiet-snapshot-interval-seconds))
-                true     (conj {:type :invoke :f :snapshot})))
-            (range quiet-snapshot-count)))))
+  ; `gen/each` gives every client process its own quiet-phase sequence instead
+  ; of sharing a single global sequence across all clients.
+  (gen/each
+   (apply gen/concat
+          (vec
+           (mapcat (fn [i]
+                     (cond-> []
+                       (pos? i) (conj (gen/sleep quiet-snapshot-interval-seconds))
+                       true     (conj (gen/once {:type :invoke :f :snapshot}))))
+                   (range quiet-snapshot-count))))))
 
 (defn snapshot-result
   [op]
@@ -83,10 +87,64 @@
 
 (defn ambiguous-write-error?
   [t]
-  (let [message (str (.getMessage t))]
+  (let [chain   (take-while some? (iterate #(.getCause %) t))
+        message (->> chain
+                     (map #(.getMessage %))
+                     (remove nil?)
+                     (str/join " | "))
+        type    (some (comp :type ex-data) chain)
+        stack   (mapcat #(seq (.getStackTrace %)) chain)
+        driver-batch-npe?
+        (and (instance? NullPointerException t)
+             (some (fn [^StackTraceElement frame]
+                     (and (= "org.mariadb.jdbc.ClientSidePreparedStatement"
+                             (.getClassName frame))
+                          (= "executeBatch" (.getMethodName frame))))
+                   stack))]
     (or (instance? java.sql.SQLTimeoutException t)
         (instance? java.sql.SQLNonTransientConnectionException t)
-        (re-find #"timed out|Connection is closed|closed connection|Connection reset|broken pipe|Socket" message))))
+        (= :connect-timed-out type)
+        driver-batch-npe?
+        (re-find #"timed(?: |-)?out|Connection is closed|closed connection|Connection reset|broken pipe|Socket" message))))
+
+(defn retryable-write-error?
+  [t]
+  (or (ambiguous-write-error? t)
+      (instance? NullPointerException t)))
+
+(defn setup-retryable-error?
+  [t]
+  (let [message (str (.getMessage t))]
+    (or (ambiguous-write-error? t)
+        (instance? java.sql.BatchUpdateException t)
+        (re-find #"Resolve lock timeout|Information schema is changed|Region is unavailable" message))))
+
+(defn close-conn-holder!
+  [conn-holder]
+  (when-let [conn @conn-holder]
+    (c/close! conn))
+  (reset! conn-holder nil))
+
+(defn ensure-conn!
+  [conn-holder node test]
+  (or @conn-holder
+      (reset! conn-holder (c/open node test))))
+
+(defn with-reconnect!
+  [conn-holder node test retryable-error? f]
+  (loop [tries 3]
+    (let [result (try
+                   (let [conn (ensure-conn! conn-holder node test)]
+                     {:ok (f conn)})
+                   (catch Throwable t
+                     {:error t}))]
+      (if-let [t (:error result)]
+        (if (and (pos? tries) (retryable-error? t))
+          (do
+            (close-conn-holder! conn-holder)
+            (recur (dec tries)))
+          (throw t))
+        (:ok result)))))
 
 (defn stored-row-matches?
   [row {:keys [id g1 v1 version last-token deleted pad]}]
@@ -99,18 +157,43 @@
        (= (if deleted 1 0) (long (:deleted row)))
        (= pad (:pad row))))
 
+(defn verification-nodes
+  [node test]
+  (->> (cons node (:nodes test))
+       (remove nil?)
+       distinct))
+
+(defn resolved-write-op
+  [op resolution node]
+  (assoc op
+         :type :ok
+         :resolved? true
+         :result {:resolution resolution
+                  :node node}))
+
+(defn exception-summary
+  [^Throwable t]
+  (or (.getMessage t)
+      (str t)))
+
+(defn verify-write-on-node!
+  [node test op]
+  (let [conn (c/open node test)]
+    (try
+      (let [row (mv/query-stored-row conn (get-in op [:value :id]))]
+        (when (stored-row-matches? row (:value op))
+          (resolved-write-op op :read-back node)))
+      (finally
+        (c/close! conn)))))
+
 (defn verify-write!
   [node test op]
-  (try
-    (let [conn (c/open node test)]
-      (try
-        (let [row (mv/query-stored-row conn (get-in op [:value :id]))]
-          (when (stored-row-matches? row (:value op))
-            (assoc op :type :ok :resolved? true :result {:verify :read-back})))
-        (finally
-          (c/close! conn))))
-    (catch Throwable _
-      nil)))
+  (some (fn [verify-node]
+          (try
+            (verify-write-on-node! verify-node test op)
+            (catch Throwable _
+              nil)))
+        (verification-nodes node test)))
 
 (defn upsert-sql
   []
@@ -125,19 +208,59 @@
        "deleted = VALUES(deleted), "
        "pad = VALUES(pad)"))
 
-(defn apply-write!
+(defn apply-write-on-conn!
   [node test conn op]
   (let [{:keys [id g1 v1 version last-token deleted pad]} (:value op)
         params [(upsert-sql)
                 id g1 v1 version last-token (if deleted 1 0) pad]]
+    (c/execute! conn params {:transaction? false})
+    (assoc op :type :ok)))
+
+(defn replay-write-on-node!
+  [node test op]
+  (let [conn-holder (atom nil)]
     (try
-      (c/execute! conn params {:transaction? false})
-      (assoc op :type :ok)
-      (catch Throwable t
-        (if (ambiguous-write-error? t)
-          (or (verify-write! node test op)
-              (assoc op :type :info :error :indeterminate-write :exception (.getMessage t)))
-          (throw t))))))
+      (with-reconnect! conn-holder node test retryable-write-error?
+        #(apply-write-on-conn! node test % op))
+      (resolved-write-op op :replay node)
+      (finally
+        (close-conn-holder! conn-holder)))))
+
+(defn replay-write!
+  [node test op]
+  (some (fn [replay-node]
+          (try
+            (replay-write-on-node! replay-node test op)
+            (catch Throwable t
+              (when (retryable-write-error? t)
+                (verify-write! replay-node test op)))))
+        (verification-nodes node test)))
+
+(defn resolve-write!
+  [node test op]
+  (or (verify-write! node test op)
+      (replay-write! node test op)))
+
+(defn apply-write!
+  [node test conn op]
+  (try
+    (apply-write-on-conn! node test conn op)
+    (catch Throwable t
+      (if (retryable-write-error? t)
+        (or (resolve-write! node test op)
+            (assoc op :type :info :error :indeterminate-write :exception (exception-summary t)))
+        (throw t)))))
+
+(defn apply-write-with-reconnect!
+  [conn-holder node test op]
+  (try
+    (with-reconnect! conn-holder node test retryable-write-error?
+      #(apply-write-on-conn! node test % op))
+    (catch Throwable t
+      (if (retryable-write-error? t)
+        (or (resolve-write! node test op)
+            (assoc op :type :info :error :indeterminate-write :exception (exception-summary t)))
+        (throw t)))))
 
 (defn query-db-now-ms
   [conn]
@@ -163,7 +286,8 @@
         log-table      (:log-table schedule-meta)
         log-row-count  (when log-table
                          (mv/count-table-rows conn log-table))
-        schedule-ddl   (mv/read-schedule-metadata conn schedule-meta)]
+        schedule-ddl   (mv/read-schedule-metadata conn schedule-meta)
+        runtime-meta   (mv/read-runtime-metadata conn schedule-meta)]
     {:snapshot-at-ms       snapshot-at-ms
      :snapshot-node        (str node)
      :db-now-ms            db-now-ms
@@ -182,10 +306,19 @@
      :log-table            log-table
      :log-row-count        log-row-count
      :schedule-metadata    schedule-ddl
+     :runtime-metadata     runtime-meta
      :row-refresh-stmt     (:row-refresh-stmt schedule-meta)
      :agg-refresh-stmt     (:agg-refresh-stmt schedule-meta)
      :purge-schedule-stmt  (:purge-schedule-stmt schedule-meta)
      :mlog-stmt            (:mlog-stmt schedule-meta)}))
+
+(defn snapshot-with-reconnect!
+  [conn-holder node test op schedule-meta]
+  (try
+    (with-reconnect! conn-holder node test retryable-write-error?
+      #(assoc op :type :ok :result (snapshot-state node % schedule-meta)))
+    (catch Throwable t
+      (assoc op :type :fail :error :snapshot-error :exception (exception-summary t)))))
 
 (defn ordered-snapshot-ops
   [snapshots]
@@ -244,17 +377,22 @@
       (every? #{:unknown} states) :unknown
       :else false)))
 
-(defrecord MVAutoschedClient [conn node schema-created? schedule-meta]
+(defrecord MVAutoschedClient [conn-holder node schema-created? schedule-meta]
   client/Client
 
   (open! [this test node]
-    (assoc this :node node :conn (c/open node test)))
+    (close-conn-holder! conn-holder)
+    (let [conn-holder' (atom nil)]
+      (with-reconnect! conn-holder' node test setup-retryable-error?
+        identity)
+      (assoc this :conn-holder conn-holder' :node node)))
 
   (setup! [this test]
     (when (compare-and-set! schema-created? false true)
       (let [ids (map key-for-process
                      (range (long (max 1 (:concurrency test)))))
-            setup (c/with-conn-failure-retry conn
+            setup (with-reconnect! conn-holder node test setup-retryable-error?
+                    (fn [conn]
                     (mv/setup-autosched-schema!
                      conn
                      ids
@@ -262,29 +400,25 @@
                       :row-refresh-seconds row-refresh-seconds
                       :agg-refresh-seconds agg-refresh-seconds
                       :purge-start-delay   purge-start-delay
-                      :purge-next-seconds  purge-next-seconds}))]
+                      :purge-next-seconds  purge-next-seconds})))]
         (reset! schedule-meta setup)))
     this)
 
   (invoke! [_ test op]
     (condp = (:f op)
-      :insert       (apply-write! node test conn op)
-      :update-value (apply-write! node test conn op)
-      :move-group   (apply-write! node test conn op)
-      :delete       (apply-write! node test conn op)
+      :insert       (apply-write-with-reconnect! conn-holder node test op)
+      :update-value (apply-write-with-reconnect! conn-holder node test op)
+      :move-group   (apply-write-with-reconnect! conn-holder node test op)
+      :delete       (apply-write-with-reconnect! conn-holder node test op)
 
-      :snapshot
-      (try
-        (assoc op :type :ok :result (snapshot-state node conn @schedule-meta))
-        (catch Throwable t
-          (assoc op :type :fail :error :snapshot-error :exception (.getMessage t))))
+      :snapshot     (snapshot-with-reconnect! conn-holder node test op @schedule-meta)
 
       (assoc op :type :fail :error :unknown-op)))
 
   (teardown! [_ _])
 
   (close! [_ _]
-    (c/close! conn)))
+    (close-conn-holder! conn-holder)))
 
 (defn checker*
   []
@@ -329,7 +463,7 @@
 
 (defn workload
   [_]
-  {:client          (MVAutoschedClient. nil nil (atom false) (atom nil))
+  {:client          (MVAutoschedClient. (atom nil) nil (atom false) (atom nil))
    :generator       (gen/stagger 1/5 (generator))
    :checker         (checker/compose {:mv-autosched (checker*)
                                       :timeline     (timeline/html)})
