@@ -59,6 +59,29 @@ mview_warn_if_experimental() {
   fi
 }
 
+mview_catalog_helper() {
+  echo "$ROOT_DIR/mview_case_catalog.py"
+}
+
+mview_emit_suite_cases() {
+  local suite="$1"
+  local workload_filter="${2:-${WORKLOAD_FILTER:-}}"
+  if [[ -n "$workload_filter" ]]; then
+    python3 "$(mview_catalog_helper)" suite-cases "$suite" --workload "$workload_filter"
+  else
+    python3 "$(mview_catalog_helper)" suite-cases "$suite"
+  fi
+}
+
+mview_run_suite_cases() {
+  local suite="$1"
+  local workload_filter="${2:-${WORKLOAD_FILTER:-}}"
+  while IFS=$'\t' read -r workload nemesis time_limit; do
+    [[ -z "$workload" ]] && continue
+    mview_run_test "$workload" "$nemesis" "$time_limit"
+  done < <(mview_emit_suite_cases "$suite" "$workload_filter")
+}
+
 mview_run_test() {
   local workload="$1"
   local nemesis="$2"
