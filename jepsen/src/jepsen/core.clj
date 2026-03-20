@@ -148,7 +148,8 @@
   logs in the event of JVM shutdown, so you can ctrl-c a test and get something
   useful."
   [test & body]
-  `(let [^Thread hook# (Thread.
+  `(let [snarfed?# (atom false)
+         ^Thread hook# (Thread.
                          (bound-fn []
                            (with-thread-name "Jepsen shutdown hook"
                              (info "Downloading DB logs before JVM shutdown...")
@@ -158,9 +159,11 @@
      (try
        (let [res# (do ~@body)]
          (snarf-logs! ~test)
+         (reset! snarfed?# true)
          res#)
        (finally
-         (maybe-snarf-logs! ~test)
+         (when-not @snarfed?#
+           (maybe-snarf-logs! ~test))
          (.. (Runtime/getRuntime) (removeShutdownHook hook#))))))
 
 (defmacro with-db
@@ -314,10 +317,12 @@
   (run-worker! [this]
     (let [gen (:generator test)]
       (loop []
+        (generator/clear-time-limit-interrupt!)
         (when @abort?
           (throw+ {:type :worker-abort}))
 
         (when-let [op (generator/op-and-validate gen test process)]
+          (generator/clear-time-limit-interrupt!)
           (let [op (assoc op
                           :process process
                           :time    (relative-time-nanos))]
@@ -396,10 +401,12 @@
   (run-worker! [this]
     (let [gen (:generator test)]
       (loop []
+        (generator/clear-time-limit-interrupt!)
         (when @abort?
           (throw+ {:type :worker-abort}))
 
         (when-let [op (generator/op-and-validate gen test :nemesis)]
+          (generator/clear-time-limit-interrupt!)
           (let [completion (-> op
                                (assoc :process :nemesis
                                       :time    (relative-time-nanos))

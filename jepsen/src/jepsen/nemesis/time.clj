@@ -7,6 +7,7 @@
                     [control :as c]
                     [generator :as gen]
                     [nemesis :as nemesis]]
+            [clojure.tools.logging :refer [warn]]
             [clojure.string :as str]
             [clojure.java.io :as io])
   (:import (java.io File)))
@@ -132,7 +133,10 @@
         (assoc op :clock-offsets res)))
 
     (teardown! [_ test]
-      (reset-time! test))))
+      (try
+        (reset-time! test)
+        (catch RuntimeException e
+          (warn "Best-effort clock reset failed during teardown:" (.getMessage e)))))))
 
 (defn reset-gen
   "Randomized reset generator. Performs resets on random subsets of the tests'

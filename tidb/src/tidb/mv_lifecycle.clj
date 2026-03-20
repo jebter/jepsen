@@ -217,13 +217,23 @@
     (assoc op :type :ok :result {:groups (count actual)
                                  :actual actual})))
 
+(defn- lifecycle-refresh-failure
+  [conn-holder node test op error t]
+  (let [actual (try
+                 (stateful/with-reconnect! conn-holder node test stateful/setup-retryable-error?
+                   mv/artifact-state)
+                 (catch Throwable _
+                   nil))]
+    (cond-> (assoc op :type :fail :error error :exception (.getMessage t))
+      actual (assoc :result {:artifact-state actual}))))
+
 (defn- lifecycle-refresh-row-with-reconnect!
   [conn-holder node test op]
   (try
     (stateful/with-reconnect! conn-holder node test stateful/ambiguous-write-error?
       #(lifecycle-refresh-row-on-conn! % op))
     (catch Throwable t
-      (assoc op :type :fail :error :refresh-row-error :exception (.getMessage t)))))
+      (lifecycle-refresh-failure conn-holder node test op :refresh-row-error t))))
 
 (defn- lifecycle-refresh-agg-with-reconnect!
   [conn-holder node test op]
@@ -231,7 +241,7 @@
     (stateful/with-reconnect! conn-holder node test stateful/ambiguous-write-error?
       #(lifecycle-refresh-agg-on-conn! % op))
     (catch Throwable t
-      (assoc op :type :fail :error :refresh-agg-error :exception (.getMessage t)))))
+      (lifecycle-refresh-failure conn-holder node test op :refresh-agg-error t))))
 
 (defn- pair-history
   [history]

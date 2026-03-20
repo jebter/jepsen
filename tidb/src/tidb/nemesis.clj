@@ -20,40 +20,94 @@
 (defn process-nemesis
   "A nemesis that can pause, resume, start, stop, and kill tidb, tikv, and pd."
   []
-  (reify nemesis/Nemesis
-    (setup! [this test] this)
+  (let [recovery-targets (atom {})]
+    (letfn [(recovery-op [f]
+              (case f
+                (:kill-pd :stop-pd) :start-pd
+                (:kill-kv :stop-kv) :start-kv
+                (:kill-db :stop-db) :start-db
+                :pause-pd           :resume-pd
+                :pause-kv           :resume-kv
+                :pause-db           :resume-db
+                nil))
+            (recovery-op? [f]
+              (contains? #{:start-pd :start-kv :start-db
+                           :resume-pd :resume-kv :resume-db}
+                         f))
+            (merge-targets [existing nodes]
+              (->> (concat (or existing []) nodes)
+                   distinct
+                   vec))
+            (remaining-targets [existing nodes]
+              (let [remaining (vec (remove (set nodes) (or existing [])))]
+                (when (seq remaining)
+                  remaining)))
+            (clear-recovery-targets [f nodes]
+              (swap! recovery-targets
+                     (fn [targets]
+                       (let [remaining (remaining-targets (get targets f) nodes)]
+                         (cond-> (dissoc targets f)
+                           (seq remaining) (assoc f remaining))))))
+            (choose-targets [test op]
+              (let [nodes (:nodes test)]
+                (vec
+                 (cond
+                   (:value op)
+                   (:value op)
 
-    (invoke! [this test op]
-      (let [nodes (:nodes test)
-            nodes (case (:f op)
-                    ; When resuming, resume all nodes
-                    (:resume-pd :resume-kv :resume-db
-                     :start-pd  :start-kv  :start-db) nodes
+                   (recovery-op? (:f op))
+                   (or (get @recovery-targets (:f op)) [])
 
-                    (take (condp > (rand) 0.4 1 0.7 2 0.85 3 0.95 4 5) (shuffle nodes)))
-            ; If the op wants to give us nodes, that's great
-            nodes (or (:value op) nodes)]
-        (assoc op :value
-               (c/on-nodes test nodes
-                           (fn [test node]
-                             (case (:f op)
-                               :start-pd  (db/start-pd! test node)
-                               :start-kv  (db/start-kv! test node)
-                               :start-db  (db/start-db! test node)
-                               :kill-pd   (db/stop-pd!  test node)
-                               :kill-kv   (db/stop-kv!  test node)
-                               :kill-db   (db/stop-db!  test node)
-                               :stop-pd   (cu/signal! db/pd-bin :TERM)
-                               :stop-kv   (cu/signal! db/kv-bin :TERM)
-                               :stop-db   (cu/signal! db/db-bin :TERM)
-                               :pause-pd  (cu/signal! db/pd-bin :STOP)
-                               :pause-kv  (cu/signal! db/kv-bin :STOP)
-                               :pause-db  (cu/signal! db/db-bin :STOP)
-                               :resume-pd (cu/signal! db/pd-bin :CONT)
-                               :resume-kv (cu/signal! db/kv-bin :CONT)
-                               :resume-db (cu/signal! db/db-bin :CONT)))))))
+                   :else
+                   (case (:f op)
+                     ; Process faults in the default suite are single-fault
+                     ; cases, so select one target node only.
+                     (:kill-pd :kill-kv :kill-db
+                      :stop-pd :stop-kv :stop-db
+                      :pause-pd :pause-kv :pause-db)
+                     (take 1 (shuffle nodes))
 
-    (teardown! [this test])))
+                     nodes)))))]
+      (reify nemesis/Nemesis
+        (setup! [this test] this)
+
+        (invoke! [this test op]
+          (let [nodes       (choose-targets test op)
+                recovery-fn (recovery-op (:f op))
+                result      (assoc op :value
+                                   (if (seq nodes)
+                                     (c/on-nodes test nodes
+                                                 (fn [test node]
+                                                   (case (:f op)
+                                                     :start-pd  (db/start-pd! test node)
+                                                     :start-kv  (db/start-kv! test node)
+                                                     :start-db  (db/start-db! test node)
+                                                     :kill-pd   (db/stop-pd!  test node)
+                                                     :kill-kv   (db/stop-kv!  test node)
+                                                     :kill-db   (db/stop-db!  test node)
+                                                     :stop-pd   (cu/signal! db/pd-bin :TERM)
+                                                     :stop-kv   (cu/signal! db/kv-bin :TERM)
+                                                     :stop-db   (cu/signal! db/db-bin :TERM)
+                                                     :pause-pd  (cu/signal! db/pd-bin :STOP)
+                                                     :pause-kv  (cu/signal! db/kv-bin :STOP)
+                                                     :pause-db  (cu/signal! db/db-bin :STOP)
+                                                     :resume-pd (cu/signal! db/pd-bin :CONT)
+                                                     :resume-kv (cu/signal! db/kv-bin :CONT)
+                                                     :resume-db (cu/signal! db/db-bin :CONT))))
+                                     {}))]
+            (cond
+              recovery-fn
+              (do (swap! recovery-targets update recovery-fn merge-targets nodes)
+                  result)
+
+              (recovery-op? (:f op))
+              (do (clear-recovery-targets (:f op) nodes)
+                  result)
+
+              :else
+              result)))
+
+        (teardown! [this test])))))
 
 (defn schedule-nemesis
   "A nemesis that can add stress test schedulers, shuffle-leader, shuffle-region
@@ -268,13 +322,26 @@
   "A generator for a partition that isolates the current PD leader in a
   minority."
   [test process]
-  (let [leader (db/await-http
-                 (db/pd-leader-node test (rand-nth (:nodes test))))
-        followers (shuffle (remove #{leader} (:nodes test)))
-        nodes       (cons leader followers)
-        components  (split-at 1 nodes) ; Maybe later rand(n/2+1?)
-        grudge      (nemesis/complete-grudge components)]
-    (op :start-partition, grudge, :partition-type :pd-leader)))
+  (try+
+    (if-let [leader (db/await-http
+                      (db/pd-leader-node test (rand-nth (:nodes test))))]
+      (let [followers  (shuffle (remove #{leader} (:nodes test)))
+            nodes      (cons leader followers)
+            components (split-at 1 nodes) ; Maybe later rand(n/2+1?)
+            grudge     (nemesis/complete-grudge components)]
+        (op :start-partition, grudge, :partition-type :pd-leader))
+      (throw+ {:type                     ::pd-leader-partition-unavailable
+               :requested-partition-type :pd-leader
+               :reason                   :leader-unresolved}))
+    (catch [:type ::pd-leader-partition-unavailable] e
+      (warn "Unable to construct pd-leader partition nemesis op" e)
+      (throw+ e))
+    (catch Object e
+      (let [failure {:type                     ::pd-leader-partition-unavailable
+                     :requested-partition-type :pd-leader
+                     :reason                   {:leader-resolution-error e}}]
+        (warn "Unable to construct pd-leader partition nemesis op" failure)
+        (throw+ failure)))))
 
 (defn partition-half-gen
   "A generator for a partition that cuts the network in half."
@@ -400,7 +467,8 @@
 
          (:enable-failpoint n)
          (conj :disable-failpoint)
-         (some n [:partition-one :partition-half :partition-ring])
+         (some n [:partition-one :partition-pd-leader
+                  :partition-half :partition-ring])
          (conj :stop-partition))
        (map #(if (keyword? %)
                (op %)

@@ -2,7 +2,9 @@
   "Provides SSH control over a remote node. There's a lot of dynamically bound
   state in this namespace because we want to make it as simple as possible for
   scripts to open connections to various nodes."
-  (:import java.io.File)
+  (:import java.io.File
+           java.net.URI
+           [com.jcraft.jsch JSch ProxySOCKS5 JSchException])
   (:require [clj-ssh.ssh    :as ssh]
             [jepsen.util    :as util :refer [real-pmap with-thread-name]]
             [dom-top.core :refer [with-retry]]
@@ -25,6 +27,9 @@
 (def ^:dynamic *strict-host-key-checking* "Verify SSH host keys"  :yes)
 (def ^:dynamic *retries*  "How many times to retry conns"   5)
 
+(def ^:const ssh-server-alive-interval-ms 15000)
+(def ^:const ssh-server-alive-count-max   6)
+
 (defn debug-data
   "Construct a map of SSH data for debugging purposes."
   []
@@ -38,6 +43,27 @@
    :port                     *port*
    :private-key-path         *private-key-path*
    :strict-host-key-checking *strict-host-key-checking*})
+
+(defn- jsch-error-message
+  [^JSchException e]
+  (or (.getMessage e)
+      (some-> e .getCause .getMessage)
+      (str e)))
+
+(defn- retryable-jsch-exception?
+  [^JSchException e]
+  (let [message (some-> (jsch-error-message e) str/lower-case)]
+    (not (or (str/includes? message "auth fail")
+             (str/includes? message "userauth fail")
+             (str/includes? message "invalid privatekey")
+             (str/includes? message "unknownhostkey")
+             (str/includes? message "reject hostkey")
+             (str/includes? message "algorithm negotiation fail")))))
+
+(defn- jsch-exception-data
+  [^JSchException e]
+  {:error-class   (str (class e))
+   :error-message (jsch-error-message e)})
 
 (defrecord Literal [string])
 
@@ -155,13 +181,13 @@
       (assoc (ssh/ssh s action)
              :host   *host*
              :action action))
-    (catch com.jcraft.jsch.JSchException e
+    (catch JSchException e
       (if (and (pos? tries)
-               (or (= "session is down" (.getMessage e))
-                   (= "Packet corrupt" (.getMessage e))))
+               (retryable-jsch-exception? e))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
         (throw+ (merge {:type ::ssh-failed}
+                       (jsch-exception-data e)
                        (debug-data)))))))
 
 (defn exec*
@@ -211,13 +237,13 @@
                           (file->path local-paths))]
         (apply ssh/scp-to s local-paths remote-path remaining)
         remote-path))
-    (catch com.jcraft.jsch.JSchException e
+    (catch JSchException e
       (if (and (pos? tries)
-               (or (= "session is down" (.getMessage e))
-                   (= "Packet corrupt" (.getMessage e))))
+               (retryable-jsch-exception? e))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
         (throw+ (merge {:type ::upload-failed}
+                       (jsch-exception-data e)
                        (debug-data)))))))
 
 (defn download
@@ -234,13 +260,13 @@
             (retry (dec tries)))
         (throw+ (assoc (debug-data)
                        :type ::download-failed))))
-    (catch com.jcraft.jsch.JSchException e
+    (catch JSchException e
       (if (and (pos? tries)
-               (or (= "session is down" (.getMessage e))
-                   (= "Packet corrupt" (.getMessage e))))
+               (retryable-jsch-exception? e))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
         (throw+ (merge {:type ::download-failed}
+                       (jsch-exception-data e)
                        (debug-data)))))))
 
 (defn expand-path
@@ -290,21 +316,64 @@
                " is a keyword; please provide node hostnames as strings. Support for keyword hosts will be removed in future versions of jepsen.")))
   (name host))
 
+(defn- parse-socks-proxy
+  []
+  (let [proxy-uri (or (System/getenv "JEPSEN_SSH_PROXY")
+                      (System/getenv "ALL_PROXY")
+                      (System/getenv "all_proxy")
+                      (System/getenv "HTTP_PROXY")
+                      (System/getenv "http_proxy"))]
+    (when (seq proxy-uri)
+      (let [uri    (URI. proxy-uri)
+            scheme (some-> (.getScheme uri) str/lower-case)
+            host   (.getHost uri)
+            port   (.getPort uri)]
+        (when (and (#{"socks5" "socks5h"} scheme)
+                   host
+                   (pos? port))
+          {:host host
+           :port port})))))
+
 (defn clj-ssh-session
   "Opens a raw session to the given host."
   [host]
-  (let [host  (check-name host)
-        agent (ssh/ssh-agent {})
-        _     (when *private-key-path*
-                (ssh/add-identity agent
-                                  {:private-key-path *private-key-path*}))]
-    (doto (ssh/session agent
-                       host
-                       {:username *username*
-                        :password *password*
-                        :port *port*
-                        :strict-host-key-checking *strict-host-key-checking*})
+  (let [host    (check-name host)
+        agent   (JSch.)
+        _       (when *private-key-path*
+                  ; clj-ssh's identity wrapper can reject keys JSch itself loads
+                  ; successfully, e.g. PEM RSA keys generated for ephemeral testbeds.
+                  ; Use JSch's native loader here so Jepsen can authenticate with a
+                  ; plain private key path without going through clj-ssh's wrapper.
+                  (.addIdentity agent *private-key-path*))
+        session (ssh/session agent
+                             host
+                             {:username *username*
+                              :password *password*
+                              :port *port*
+                              :strict-host-key-checking *strict-host-key-checking*})]
+    (when-let [{:keys [host port]} (parse-socks-proxy)]
+      (.setProxy session (ProxySOCKS5. host port)))
+    (doto session
+      (.setServerAliveInterval ssh-server-alive-interval-ms)
+      (.setServerAliveCountMax ssh-server-alive-count-max)
       (ssh/connect))))
+
+(defn- jsch-session-read-npe?
+  [t]
+  (and (instance? NullPointerException t)
+       (some (fn [^StackTraceElement frame]
+               (and (= "com.jcraft.jsch.Session" (.getClassName frame))
+                    (= "read" (.getMethodName frame))))
+             (.getStackTrace t))))
+
+(defn- session-open-error-data
+  [host t]
+  (merge {:type ::session-error
+          :message "Error opening SSH session. Verify username, password, and node hostnames are correct."
+          :host host
+          :error-class (str (class t))
+          :error-message (.getMessage t)}
+         (debug-data)))
 
 (defn session
   "Wraps clj-ssh-session in a wrapper for reconnection."
@@ -312,13 +381,19 @@
   (rc/open!
    (rc/wrapper {:open  (if *dummy*
                          (fn [] [:dummy host])
-                         (fn [] (try+
-                                  (clj-ssh-session host)
-                                  (catch com.jcraft.jsch.JSchException _
-                                    (throw+ (merge {:type ::session-error
-                                                    :message "Error opening SSH session. Verify username, password, and node hostnames are correct."
-                                                    :host host}
-                                                   (debug-data)))))))
+                         (fn []
+                           (with-retry [tries *retries*]
+                             (try+
+                              (clj-ssh-session host)
+                              (catch Object t
+                                (if (and (pos? tries)
+                                         (or (jsch-session-read-npe? t)
+                                             (and (instance? JSchException t)
+                                                  (retryable-jsch-exception? t))))
+                                  (do
+                                    (Thread/sleep (+ 1000 (rand-int 1000)))
+                                    (retry (dec tries)))
+                                  (throw+ (session-open-error-data host t))))))))
                 :name  [:control host]
                 :close (if *dummy*
                          identity

@@ -12,4 +12,5 @@
                  [org.mariadb.jdbc/mariadb-java-client "2.4.1"]
                  [javax.xml.bind/jaxb-api "2.3.1"]
                  [org.glassfish.jaxb/jaxb-runtime "2.3.1"]]
-  :aot [tidb.core clojure.tools.logging.impl])
+  :aot [clojure.tools.logging.impl]
+  :profiles {:uberjar {:aot [tidb.core clojure.tools.logging.impl]}})

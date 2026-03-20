@@ -3,6 +3,7 @@
 This file is the handoff guide for TiDB Jepsen MView work. It explains which workload owns which problem, how branch builds enter Jepsen, and what a build manifest must contain so other threads can reproduce failures.
 
 Use `doc/mview-review-checklist.md` when doing code review or design review on the MView Jepsen stack.
+Use `doc/mview-debug-runbook.md` when doing execution triage, branch-build debugging, or `test-plan` / `tcctl run` reproduction work.
 
 ## Status
 
@@ -197,6 +198,8 @@ Suite definitions:
 - `autosched-longrun`: long-run `mv-autosched` stability suite
 
 ## Suggested execution order
+
+For the practical debug loop, stop rules, artifact triage order, and `test-plan` handoff boundary, use `doc/mview-debug-runbook.md`.
 
 1. Run `branch-validation` first as the fast smoke gate.
 2. Run `full-single-fault` second to materialize the complete 42-case debug input.

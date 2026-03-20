@@ -14,21 +14,39 @@
   "How long will we wait for an open call by default"
   5000)
 
+(defn sql-tunnel-port-map
+  "Optional JSON map from node name to a localhost port forwarded to that
+  node's SQL endpoint, e.g. {\"node-0...\":24001}."
+  []
+  (some-> (System/getenv "JEPSEN_SQL_TUNNEL_PORTS")
+          (json/parse-string)))
+
 (defn conn-spec
   "jdbc connection spec for a node."
   [node]
-  {:classname       "org.mariadb.jdbc.Driver"
-   :subprotocol     "mariadb"
-   :subname         (str "//" (name node) ":4000/test")
-   :user            "root"
-   :password        ""
-   :connectTimeout  connect-timeout
-   :socketTimeout   socket-timeout})
+  (let [node-name   (name node)
+        tunnel-port (get (sql-tunnel-port-map) node-name)
+        host        (if tunnel-port "127.0.0.1" node-name)
+        port        (or tunnel-port 4000)]
+    {:classname       "org.mariadb.jdbc.Driver"
+     :subprotocol     "mariadb"
+     :subname         (str "//" host ":" port "/test")
+     :user            "root"
+     :password        ""
+     :connectTimeout  connect-timeout
+     :socketTimeout   socket-timeout}))
 
 (defn txn-mode
   [test]
   (let [mode (:txn-mode test "pessimistic")]
     (if (= "mixed" mode) (rand-nth ["pessimistic" "optimistic"]) mode)))
+
+(defn supports-tidb-txn-mode?
+  "TiDB v3.0.0-beta.1 does not expose @@tidb_txn_mode."
+  [test]
+  (let [version (some-> (:version test) str str/lower-case)]
+    (not (boolean (and version
+                       (re-find #"^v?3\.0\.0-beta\.1$" version))))))
 
 (defn init-sql
   [test]
@@ -36,7 +54,7 @@
           (not= :default (:auto-retry test)) (conj (str "set @@tidb_disable_txn_auto_retry = " (if (:auto-retry test) 0 1)))
           (not= :default (:auto-retry-limit test)) (conj (str "set @@tidb_retry_limit = " (:auto-retry-limit test 10)))
           (:follower-read test) (conj "set @@tidb_replica_read = 'follower'")
-          true (conj (str "set @@tidb_txn_mode = '" (txn-mode test) "'"))
+          (supports-tidb-txn-mode? test) (conj (str "set @@tidb_txn_mode = '" (txn-mode test) "'"))
           true (conj "set @@tidb_general_log = 1")))
 
 (defn init-conn!
@@ -68,7 +86,11 @@
                                             ::test (select-keys
                                                      test
                                                      [:auto-retry
-                                                      :auto-retry-limit]))
+                                                      :auto-retry-limit
+                                                      :version
+                                                      :txn-mode
+                                                      :follower-read
+                                                      :init-sql]))
                                 conn   (j/get-connection spec)
                                 spec'  (j/add-connection spec conn)]
                             (assert spec')
@@ -86,6 +108,30 @@
   (when-let [c (j/db-find-connection conn)]
     (.close c))
   (dissoc conn :connection))
+
+(def ^:private abort-executor
+  (reify java.util.concurrent.Executor
+    (execute [_ task]
+      (.run ^Runnable task))))
+
+(defn abort!
+  "Best-effort hard-abort for a JDBC connection. MariaDB's abort path avoids
+  blocking on the protocol close lock when a partitioned socket is stuck."
+  [conn]
+  (if-let [c (j/db-find-connection conn)]
+    (do
+      (try
+        (.abort ^java.sql.Connection c abort-executor)
+        (catch AbstractMethodError _
+          (.close c))
+        (catch java.sql.SQLFeatureNotSupportedException _
+          (.close c))
+        (catch UnsupportedOperationException _
+          (.close c))
+        (catch Throwable t
+          (warn t "Failed to abort JDBC connection")))
+      (dissoc conn :connection))
+    (close! conn)))
 
 (defn reopen!
   "Closes a connection and returns a new one based on the given connection."
@@ -140,7 +186,7 @@
                     (info "Out of retries!")
                     (throw ~e))
                   (info "Connection failure; retrying...")
-                  (Thread/sleep (rand-int 2000))
+                  (java.lang.Thread/sleep (long (rand-int 2000)))
                   (~'retry (reopen! ~conn-sym) (dec ~tries)))]
  `(dt/with-retry [~conn-sym ~conn
                   ~tries    32]
@@ -153,6 +199,7 @@
       (condp re-find (.getMessage ~e)
         #"Resolve lock timeout"           ~retry ; high contention
         #"Information schema is changed"  ~retry ; ???
+        #"\[try again later\]"            ~retry ; optimistic write conflict
         #"called on closed connection"    ~retry ; definitely didn't happen
         #"Region is unavailable"          ~retry ; okay fine
         (do (info "with-conn-failure-retry isn't sure how to handle SQLException with message" (pr-str (class (.getMessage ~e))) (pr-str (.getMessage ~e)))
@@ -165,23 +212,31 @@
 (defn await-node
   "Waits for a node to become ready by opening a connection, creating a table,
   and inserting a record."
-  [node]
+  [test node]
   (info "Waiting for" node)
   ; Give it 30 seconds to open a connection
-  (if (let [c (open node {} 30000)]
-        (try
-          ; And however long it takes to run these
-          (with-conn-failure-retry c
-            (j/execute! c ["update mysql.tidb set variable_value='72h' where variable_name='tikv_gc_life_time'"])
-            (j/execute! c ["create table if not exists jepsen_await
-                           (id int primary key, val int)"]))
-            (j/insert! c "jepsen_await" {:id  (swap! await-id inc)
-                                         :val (rand-int 5)})
-          true
-          (finally
-            (close! c))))
+  (if (let [conn-holder (atom (open node test 30000))
+            c           @conn-holder]
+        (let [ready? (try
+                       ; And however long it takes to run these
+                       (with-conn-failure-retry c
+                         (reset! conn-holder c)
+                         (j/execute! c ["update mysql.tidb set variable_value='72h' where variable_name='tikv_gc_life_time'"])
+                         (j/execute! c ["create table if not exists jepsen_await
+                                        (id int primary key, val int)"])
+                         (j/execute! c ["insert into jepsen_await (id, val) values (?, ?)"
+                                        (swap! await-id inc)
+                                        (rand-int 5)]))
+                       true
+                       (catch Throwable t
+                         (when-let [conn @conn-holder]
+                           (close! conn))
+                         (throw t)))]
+          (when-let [conn @conn-holder]
+            (close! conn))
+          ready?))
     (info node "ready")
-    (recur node)))
+    (recur test node)))
 
 (def rollback-msg
   "mariadb drivers have a few exception classes that use this message"
@@ -270,7 +325,7 @@
   [[c node] & body]
   `(j/with-db-connection [~c (conn-spec ~node)]
      (when (.isClosed (j/db-find-connection ~c))
-       (Thread/sleep 1000)
+       (java.lang.Thread/sleep 1000)
        (throw (ex-info "Connection not yet ready."
                        {:type :conn-not-ready})))
      ~@body))

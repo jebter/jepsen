@@ -2,7 +2,6 @@
   (:require [clojure.tools.logging :refer :all]
             [clojure.string :as str]
             [clojure.java.io :as io]
-            [clj-http.client :as http]
             [cheshire.core :as json]
             [dom-top.core :refer [with-retry]]
             [fipp.edn :refer [pprint]]
@@ -68,6 +67,12 @@
     :pid-file (str tidb-dir "/pd-scheduling.pid")
     :port-offset 200}})
 
+(declare ensure-parent-dir!
+         normalize-file-path!
+         prepare-daemon-files!
+         process-running?
+         cleanup-db-runtime-artifacts!)
+
 (def client-port 2379)
 (def peer-port   2380)
 
@@ -115,23 +120,35 @@
 (defn configure-pd!
   "Writes configuration file for placement driver"
   []
-  (c/su (c/exec :echo (slurp (io/resource "pd.conf")) :> pd-config-file)))
+  (c/su
+    (ensure-parent-dir! pd-config-file)
+    (normalize-file-path! pd-config-file)
+    (c/exec :echo (slurp (io/resource "pd.conf")) :> pd-config-file)))
 
 (defn configure-kv!
   "Writes configuration file for tikv"
   []
-  (c/su (c/exec :echo (slurp (io/resource "tikv.conf")) :> kv-config-file)))
+  (c/su
+    (ensure-parent-dir! kv-config-file)
+    (normalize-file-path! kv-config-file)
+    (c/exec :echo (slurp (io/resource "tikv.conf")) :> kv-config-file)))
 
 (defn configure-db!
   "Writes configuration file for tidb"
   []
-  (c/su (c/exec :echo (slurp (io/resource "tidb.conf")) :> db-config-file)))
+  (c/su
+    (ensure-parent-dir! db-config-file)
+    (normalize-file-path! db-config-file)
+    (c/exec :echo (slurp (io/resource "tidb.conf")) :> db-config-file)))
 
 (defn configure-system-db!
   "Writes configuration file for the SYSTEM keyspace TiDB instance"
   []
-  (c/su (c/exec :echo (slurp (io/resource "system-tidb.conf"))
-                :> system-db-config-file)))
+  (c/su
+    (ensure-parent-dir! system-db-config-file)
+    (normalize-file-path! system-db-config-file)
+    (c/exec :echo (slurp (io/resource "system-tidb.conf"))
+            :> system-db-config-file)))
 
 (defn configure!
   "Write all config files."
@@ -145,19 +162,65 @@
   [node & path-components]
   (str "http://" node ":2379/pd/api/v1/" (str/join "/" path-components)))
 
+(defn pd-api-local-path
+  "Constructs a loopback PD API path to be queried from inside a node over SSH."
+  [& path-components]
+  (str "http://127.0.0.1:2379/pd/api/v1/" (str/join "/" path-components)))
+
+(defn pd-success-status?
+  [status]
+  (and (integer? status)
+       (<= 200 status 299)))
+
+(defn pd-http-error!
+  [{:keys [status path body]}]
+  (throw+ {:type   ::pd-http-error
+           :status status
+           :path   path
+           :body   body}))
+
+(defn pd-request!
+  "Executes a PD API request from inside the target node and returns a response
+  map with :status, :path, and :body."
+  [node method & path-components]
+  (let [path   (str/join "/" path-components)
+        raw    (c/on node
+                  (apply c/exec
+                         (concat [:curl :--silent :--show-error
+                                  :--write-out "\\n%{http_code}"]
+                                 (when method
+                                   [:-X method])
+                                 [(apply pd-api-local-path path-components)])))
+        lines  (str/split-lines raw)
+        status (some-> (last lines) Integer/parseInt)
+        body   (str/join "\n" (butlast lines))
+        resp   {:status status
+                :path   path
+                :body   body}]
+    (if (pd-success-status? status)
+      resp
+      (pd-http-error! resp))))
+
+(defn pd-get-json
+  "Fetches PD JSON by curling the local node over SSH, so the control node does
+  not need direct DNS or network access to the cluster-internal address."
+  [node & path-components]
+  (json/parse-string (:body (apply pd-request! node nil path-components)) true))
+
+(defn pd-post!
+  "Posts to a PD API endpoint via loopback curl on the target node."
+  [node & path-components]
+  (:body (apply pd-request! node :POST path-components)))
+
 (defn pd-members
   "All members of the cluster"
   [node]
-  (-> (pd-api-path node "members")
-      (http/get {:as :json})
-      :body))
+  (pd-get-json node "members"))
 
 (defn pd-leader
   "Gets the current PD leader."
   [node]
-  (-> (pd-api-path node "leader")
-      (http/get {:as :json})
-      :body))
+  (pd-get-json node "leader"))
 
 (defn pd-leader-node
   "Returns the name of the node which is the current PD leader."
@@ -173,15 +236,15 @@
   "Transfer leadership to the given leader map."
   [node next-leader]
   (assert (map? next-leader))
-  (-> (pd-api-path node "leader" "transfer" (:name next-leader))
-      (http/post)))
+  (pd-post! node "leader" "transfer" (:name next-leader)))
 
 (defn pd-regions
   "All PD regions"
   [node]
-  (-> (pd-api-path node "regions")
-      (http/get {:as :json})
-      :body))
+  (pd-get-json node "regions"))
+
+(declare prepare-daemon-files!
+         process-running?)
 
 (defmacro await-http
   "Loops body until HTTP call returns, retrying 500 and 503 errors."
@@ -196,28 +259,32 @@
 
 (defn start-pd-service!
   [test node svc]
-  (c/su
-   (cu/start-daemon!
-    {:logfile (get-in pd-services [svc :stdout])
-     :pidfile (get-in pd-services [svc :pid-file])
-     :chdir   tidb-dir
-     :process-name (get-in pd-services [svc :bin])}
-    (str "./bin/" (get-in pd-services [svc :bin]))
-    "services" svc
-    :--log-file                 (get-in pd-services [svc :log-file])
-    :--config                   pd-config-file
-    (condp = svc
-      :api
-      [:--name                  (get-in (tidb-map test) [node :pd])
-       :--data-dir              pd-data-dir
-       :--client-urls           (str "http://0.0.0.0:" client-port)
-       :--peer-urls             (str "http://0.0.0.0:" peer-port)
-       :--advertise-client-urls (client-url node)
-       :--advertise-peer-urls   (peer-url node)
-       :--initial-cluster       (initial-cluster test)]
-      [:--listen-addr           (node-url node (+ client-port (get-in pd-services [svc :port-offset])))
-       :--advertise-listen-addr (node-url node (+ client-port (get-in pd-services [svc :port-offset])))
-       :--backend-endpoints     (str "http://0.0.0.0:" client-port)]))))
+  (let [svc-info (get pd-services svc)]
+    (c/su
+      (prepare-daemon-files! {:stdout (:stdout svc-info)
+                              :log    (:log-file svc-info)
+                              :pid    (:pid-file svc-info)})
+      (cu/start-daemon!
+       {:logfile (:stdout svc-info)
+        :pidfile (:pid-file svc-info)
+        :chdir   tidb-dir
+        :process-name (:bin svc-info)}
+       (str "./bin/" (:bin svc-info))
+       "services" svc
+       :--log-file                 (:log-file svc-info)
+       :--config                   pd-config-file
+       (condp = svc
+         :api
+         [:--name                  (get-in (tidb-map test) [node :pd])
+          :--data-dir              pd-data-dir
+          :--client-urls           (str "http://0.0.0.0:" client-port)
+          :--peer-urls             (str "http://0.0.0.0:" peer-port)
+          :--advertise-client-urls (client-url node)
+          :--advertise-peer-urls   (peer-url node)
+          :--initial-cluster       (initial-cluster test)]
+         [:--listen-addr           (node-url node (+ client-port (:port-offset svc-info)))
+          :--advertise-listen-addr (node-url node (+ client-port (:port-offset svc-info)))
+          :--backend-endpoints     (str "http://0.0.0.0:" client-port)])))))
 
 (defn start-pd!
   "Starts the placement driver daemon"
@@ -228,6 +295,9 @@
       (start-pd-service! test node :tso)
       (start-pd-service! test node :scheduling))
     (c/su
+     (prepare-daemon-files! {:stdout pd-stdout
+                             :log    pd-log-file
+                             :pid    pd-pid-file})
      (cu/start-daemon!
       {:logfile pd-stdout
        :pidfile pd-pid-file
@@ -249,25 +319,30 @@
   "Starts the TiKV daemon"
   [test node]
   (c/su
-    (cu/start-daemon!
-      {:logfile kv-stdout
-       :pidfile kv-pid-file
-       :chdir   tidb-dir
-       :env {:FAILPOINTS (-> (System/getenv) (get "KV_FAILPOINTS" ""))}
-       }
-      (str "./bin/" kv-bin)
-      :--pd                    (pd-endpoints test)
-      :--addr                  (str "0.0.0.0:20160")
-      :--advertise-addr        (str (name node) ":" "20160")
-      :--advertise-status-addr (str (name node) ":" "20180")
-      :--data-dir              kv-data-dir
-      :--log-file              kv-log-file
-      :--config                kv-config-file)))
+    (prepare-daemon-files! {:stdout kv-stdout
+                            :log    kv-log-file
+                            :pid    kv-pid-file})
+    (apply cu/start-daemon!
+           {:logfile kv-stdout
+            :pidfile kv-pid-file
+            :chdir   tidb-dir
+            :env {:FAILPOINTS (-> (System/getenv) (get "KV_FAILPOINTS" ""))}
+            }
+           (str "./bin/" kv-bin)
+           [:--pd             (pd-endpoints test)
+            :--addr           (str "0.0.0.0:20160")
+            :--advertise-addr (str (name node) ":" "20160")
+            :--data-dir       kv-data-dir
+            :--log-file       kv-log-file
+            :--config         kv-config-file])))
 
 (defn start-db!
   "Starts the TiDB daemon"
   [test node]
   (c/su
+    (prepare-daemon-files! {:stdout db-stdout
+                            :log    db-log-file
+                            :pid    db-pid-file})
     (cu/start-daemon!
       {:logfile db-stdout
        :pidfile db-pid-file
@@ -284,6 +359,9 @@
   "Starts the SYSTEM keyspace TiDB daemon"
   [test node]
   (c/su
+    (prepare-daemon-files! {:stdout system-db-stdout
+                            :log    system-db-log-file
+                            :pid    system-db-pid-file})
     (cu/start-daemon!
       {:logfile system-db-stdout
        :pidfile system-db-pid-file
@@ -379,6 +457,7 @@
   (restart-loop :pd (start-pd! test node)
                 (cond (pd-ready?)                       :ready
                       (cu/daemon-running? pd-pid-file)  :starting
+                      (process-running? pd-config-file) :starting
                       true                              :crashed)))
 
 (defn start-wait-kv!
@@ -387,6 +466,7 @@
   (restart-loop :kv (start-kv! test node)
                 (cond (kv-ready?)                       :ready
                       (cu/daemon-running? kv-pid-file)  :starting
+                      (process-running? kv-config-file) :starting
                       true                              :crashed)))
 
 (defn start-wait-db!
@@ -395,6 +475,7 @@
   (restart-loop :db (start-db! test node)
                 (cond (db-ready?)                       :ready
                       (cu/daemon-running? db-pid-file)  :starting
+                      (process-running? db-config-file) :starting
                       true                              :crashed)))
 
 (defn start-wait-system-db!
@@ -403,6 +484,7 @@
   (restart-loop :system-db (start-system-db! test node)
                 (cond (system-db-ready?)                       :ready
                       (cu/daemon-running? system-db-pid-file)  :starting
+                      (process-running? system-db-config-file) :starting
                       true                                     :crashed)))
 
 (defn stop-pd-service! [test node svc]
@@ -456,26 +538,204 @@
     true
     (catch RuntimeException _ false)))
 
+(defn ensure-parent-dir!
+  [path]
+  (when-let [parent (.getParent (io/file path))]
+    (c/exec :mkdir :-p parent)))
+
+(defn normalize-file-path!
+  "Ensures a path intended to be a regular file is not occupied by a directory."
+  [path]
+  (ensure-parent-dir! path)
+  (when (directory? path)
+    (warn "Removing directory occupying file path" path)
+    (c/exec :rm :-rf path)))
+
+(defn prepare-daemon-files!
+  "Normalizes stdout/log/pid paths before daemon start."
+  [{:keys [stdout log pid]}]
+  (doseq [path [stdout log]]
+    (when path
+      (normalize-file-path! path)
+      (c/exec :touch path)))
+  (when pid
+    (normalize-file-path! pid)
+    (c/exec :rm :-f pid)))
+
+(defn process-running?
+  "Best-effort process liveness check using a distinctive command-line pattern."
+  [pattern]
+  (try+
+    (c/exec :ps :aux
+            c/| :grep pattern
+            c/| :grep :-v "grep"
+            c/| :grep :-v "bash -c")
+    true
+    (catch [:type :jepsen.control/nonzero-exit] _ false)))
+
+(defn cleanup-db-runtime-artifacts!
+  "Removes TiDB runtime temp dirs left behind by prior runs."
+  []
+  (doseq [path ["/tmp/0_tidb"
+                "/tmp/tidb"
+                "/tmp/tidb-4000.sock"
+                "/tmp/tidb-14000.sock"]]
+    (c/exec :rm :-rf path)))
+
 (defn ensure-bin-layout!
   "Normalizes devbuild tarballs so /opt/tidb is always a directory and
   /opt/tidb/bin always exists before component override tarballs are applied."
   []
-  (when (and (cu/exists? tidb-dir)
-             (not (directory? tidb-dir)))
-    (info "Normalizing single-file TiDB tarball layout")
-    (let [root-bin (str tidb-dir ".root-bin")]
-      (c/exec :mv tidb-dir root-bin)
+  (let [root-bin    (str tidb-dir ".root-bin")
+        db-bin-path (str tidb-dir "/" db-bin)]
+    ; Recover from an interrupted normalization that already moved the binary
+    ; aside but did not recreate tidb-dir/tidb-server.
+    (when (and (cu/exists? root-bin)
+               (not (cu/exists? tidb-dir)))
+      (info "Recovering interrupted TiDB bin layout normalization")
       (c/exec :mkdir :-p tidb-dir)
-      (c/exec :mv root-bin (str tidb-dir "/" db-bin))))
-  ; Some tarballs place binaries directly in tidb-dir instead of tidb/bin.
-  ; Ensure a consistent ./bin layout before applying component overrides.
-  (when (not (cu/exists? tidb-bin-dir))
-    (info "Creating bin layout for TiDB tarball")
-    (c/exec :mkdir :-p tidb-bin-dir)
-    (doseq [b [pd-bin kv-bin db-bin pdctl-bin]]
-      (when (cu/exists? (str tidb-dir "/" b))
-        (c/exec :ln :-sf (str tidb-dir "/" b)
-                (str tidb-bin-dir "/" b))))))
+      (c/exec :mv :-f root-bin db-bin-path))
+
+    (when (and (cu/exists? tidb-dir)
+               (not (directory? tidb-dir)))
+      (info "Normalizing single-file TiDB tarball layout")
+      (when (cu/exists? root-bin)
+        (warn "Removing stale TiDB normalization staging file" root-bin)
+        (c/exec :rm :-f root-bin))
+      (c/exec :mv :-f tidb-dir root-bin)
+      (c/exec :mkdir :-p tidb-dir)
+      (c/exec :mv :-f root-bin db-bin-path))
+
+    ; Recover from an interrupted normalization that already created tidb-dir
+    ; but crashed before moving the staged binary into place.
+    (when (and (cu/exists? root-bin)
+               (directory? tidb-dir)
+               (not (cu/exists? db-bin-path)))
+      (info "Finishing interrupted TiDB bin layout normalization")
+      (c/exec :mv :-f root-bin db-bin-path))
+
+    (when (and (cu/exists? root-bin)
+               (cu/exists? db-bin-path))
+      (warn "Removing stale TiDB normalization staging file" root-bin)
+      (c/exec :rm :-f root-bin))
+
+    ; Some tarballs place binaries directly in tidb-dir instead of tidb/bin.
+    ; Ensure a consistent ./bin layout before applying component overrides.
+    (when (not (cu/exists? tidb-bin-dir))
+      (info "Creating bin layout for TiDB tarball")
+      (c/exec :mkdir :-p tidb-bin-dir)
+      (doseq [b [pd-bin kv-bin db-bin pdctl-bin]]
+        (when (cu/exists? (str tidb-dir "/" b))
+          (c/exec :ln :-sf (str tidb-dir "/" b)
+                  (str tidb-bin-dir "/" b)))))))
+
+(defn ensure-component-bin-links!
+  "Links nested binaries from component override tarballs back into tidb/bin.
+  Some component archives unpack under an extra top-level directory or nested
+  bin/ directory, which leaves start-daemon looking in the wrong place."
+  []
+  (doseq [b [pd-bin pdctl-bin kv-bin db-bin]]
+    (let [root-path (str tidb-bin-dir "/" b)]
+      (when (directory? root-path)
+        (warn "Removing directory occupying binary path" root-path)
+        (c/exec :rm :-rf root-path))
+      (when-not (cu/exists? root-path)
+        (let [candidate (-> (try+
+                              (c/exec :find tidb-bin-dir
+                                      :-mindepth 2
+                                      :-name b
+                                      c/| :head :-n 1)
+                              (catch [:type :jepsen.control/nonzero-exit] _
+                                ""))
+                            str/trim)]
+          (when (and (not (str/blank? candidate))
+                     (not (directory? candidate)))
+            (info "Linking nested component binary" b "from" candidate)
+            (c/exec :ln :-sf candidate root-path)))))))
+
+(def required-binaries
+  "The binary entrypoints Jepsen expects under tidb/bin before setup starts
+  services."
+  [pd-bin kv-bin db-bin])
+
+(defn path-live?
+  "Returns true when a path resolves to an existing filesystem object. Unlike
+  jepsen.control.util/exists?, this treats broken symlinks as missing."
+  [path]
+  (try
+    (c/exec :test :-e path)
+    true
+    (catch RuntimeException _
+      false)))
+
+(defn missing-required-binaries
+  "Returns required binaries missing from tidb/bin, including broken symlinks."
+  []
+  (->> required-binaries
+       (remove #(path-live? (str tidb-bin-dir "/" %)))
+       vec))
+
+(defn install-required-reason
+  "Explains why the base TiDB archive must be reinstalled."
+  [test]
+  (cond
+    (:force-reinstall test)
+    :force-reinstall
+
+    (not (cu/exists? tidb-dir))
+    :missing-install-dir
+
+    :else
+    (let [missing (missing-required-binaries)]
+      (when (seq missing)
+        [:missing-binaries missing]))))
+
+(defn install-elapsed-ms
+  [started-at]
+  (long (/ (double (- (System/nanoTime) started-at)) 1000000.0)))
+
+(defn install-rethrow!
+  [e]
+  (if (instance? Throwable e)
+    (throw e)
+    (throw+ e)))
+
+(defn install-error-summary
+  [e]
+  (cond
+    (map? e)
+    (merge (select-keys e [:type :exit :status :path])
+           (when-let [err (:err e)]
+             {:err (str/trim err)})
+           (when-let [body (:body e)]
+             {:body body}))
+
+    (instance? Throwable e)
+    {:exception-class (.getName (class e))
+     :message         (.getMessage e)}
+
+    :else
+    {:error e}))
+
+(defn log-install-stage
+  [node stage fields]
+  (info node "TiDB install" (merge {:stage stage} fields)))
+
+(defn run-install-stage!
+  [node stage fields f]
+  (let [started-at (System/nanoTime)]
+    (log-install-stage node (keyword (str (name stage) "-start")) fields)
+    (try+
+      (let [result (f)]
+        (log-install-stage node (keyword (str (name stage) "-done"))
+                           (merge fields {:elapsed-ms (install-elapsed-ms started-at)}))
+        result)
+      (catch Object e
+        (log-install-stage node (keyword (str (name stage) "-failed"))
+                           (merge fields
+                                  {:elapsed-ms (install-elapsed-ms started-at)}
+                                  (install-error-summary e)))
+        (install-rethrow! e)))))
 
 ; (defn setup-faketime!
 ;   "Configures the faketime wrapper for this node, so that the given binary runs
@@ -494,22 +754,47 @@
   cluster."
   [test node]
   (c/su
-    (when (or (:force-reinstall test)
-              (not (cu/exists? tidb-dir)))
+    (when-let [reason (install-required-reason test)]
       (info node "installing TiDB")
-      (info (tarball-url test))
-      (cu/install-archive! (tarball-url test) tidb-dir)
-      (ensure-bin-layout!)
+      (info node "TiDB install reason" reason)
+      (log-install-stage node :plan {:reason reason
+                                     :tarball-url (tarball-url test)
+                                     :binary-override-count (count (:binary-urls test))})
+      (run-install-stage! node :base-archive
+                          {:tarball-url (tarball-url test)
+                           :dest tidb-dir
+                           :failure-bucket :download-or-extract-failed}
+                          #(cu/install-archive! (tarball-url test) tidb-dir))
+      (run-install-stage! node :bin-layout
+                          {:tidb-dir tidb-dir
+                           :tidb-bin-dir tidb-bin-dir
+                           :failure-bucket :bin-layout-failed}
+                          #(ensure-bin-layout!))
       (doseq [url (:binary-urls test)]
-        (info "Downloading additional binary from" url)
-        (let [f (cu/cached-wget! url)]
-          (c/exec :tar :-xf f :-C tidb-bin-dir)))
+        (run-install-stage! node :binary-override
+                            {:url url
+                             :dest tidb-bin-dir
+                             :failure-bucket :override-download-or-extract-failed}
+                            #(let [f (cu/cached-wget! url)]
+                               (c/exec :tar :-xf f :-C tidb-bin-dir))))
+      (run-install-stage! node :component-links
+                          {:dest tidb-bin-dir
+                           :failure-bucket :override-link-failed}
+                          #(ensure-component-bin-links!))
+      (let [missing (missing-required-binaries)]
+        (if (seq missing)
+          (warn node "Missing required TiDB binaries after install" missing)
+          (log-install-stage node :required-binaries-ready
+                             {:binaries required-binaries})))
       (when (:pd-services test)
         (info "Creating symbol links for PD services")
         (doseq [[_ info] pd-services]
           (c/exec :ln :-sf (str tidb-bin-dir "/" pd-bin) (str tidb-bin-dir "/" (get info :bin)))))
-      (info "Syncing disks to avoid slow fsync on db start")
-      (c/exec :sync))
+      (run-install-stage! node :sync
+                          {:failure-bucket :sync-failed}
+                          #(do
+                             (info "Syncing disks to avoid slow fsync on db start")
+                             (c/exec :sync)))
       (info "Syncing disks done")
     ; (if-let [ratio (:faketime test)]
     ;   (do ; We need a special fork of faketime specifically for tikv, which
@@ -525,7 +810,7 @@
     ;         (faketime/unwrap! pd-bin)
     ;         (faketime/unwrap! kv-bin)
     ;         (faketime/unwrap! db-bin)))
-   ))
+   )))
 
 (defn region-ready?
   "Does the given region have enough replicas?"
@@ -570,6 +855,7 @@
         (info node "resetting TiDB")
         (c/su
           (stop! test node)
+          (cleanup-db-runtime-artifacts!)
           (try+ (->> (cu/ls tidb-dir)
                      (remove #{"bin"})
                      (map (partial str tidb-dir "/"))
@@ -616,7 +902,7 @@
                 ; open a connection. I've lowered the await-node timeout, and if
                 ; we fail here, we'll nuke the entire setup process and try
                 ; again. <sigh>
-                (sql/await-node node)
+                (sql/await-node test node)
 
                 (catch [:type :gave-up-waiting-for-replica-count] e
                   (throw+ {:type :jepsen.db/setup-failed}))
