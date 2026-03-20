@@ -73,21 +73,170 @@ mview_emit_suite_cases() {
   fi
 }
 
+mview_timestamp() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+mview_safe_name() {
+  printf '%s' "$1" | tr -c '[:alnum:]._-' '_'
+}
+
+mview_tsv_escape() {
+  printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+mview_init_suite_outputs() {
+  local suite_output_dir="${MVIEW_SUITE_OUTPUT_DIR:-${SUITE_OUTPUT_DIR:-}}"
+  if [[ -z "$suite_output_dir" ]]; then
+    return 0
+  fi
+
+  MVIEW_SUITE_OUTPUT_DIR="$suite_output_dir"
+  MVIEW_RUNNER_LOG="${MVIEW_RUNNER_LOG:-$MVIEW_SUITE_OUTPUT_DIR/runner.log}"
+  MVIEW_STATUS_TSV="${MVIEW_STATUS_TSV:-$MVIEW_SUITE_OUTPUT_DIR/status.tsv}"
+  MVIEW_CASE_LOG_DIR="${MVIEW_CASE_LOG_DIR:-$MVIEW_SUITE_OUTPUT_DIR/case-logs}"
+  export MVIEW_SUITE_OUTPUT_DIR MVIEW_RUNNER_LOG MVIEW_STATUS_TSV MVIEW_CASE_LOG_DIR
+
+  mkdir -p "$MVIEW_SUITE_OUTPUT_DIR" "$MVIEW_CASE_LOG_DIR"
+  touch "$MVIEW_RUNNER_LOG"
+  if [[ ! -f "$MVIEW_STATUS_TSV" ]]; then
+    printf 'timestamp\tevent\tworkload\tnemesis\ttime_limit\texit_code\tstore_dirs\tcase_log\ttarball_url\tbinary_urls\n' > "$MVIEW_STATUS_TSV"
+  fi
+}
+
+mview_log_progress() {
+  local timestamp
+  timestamp="$(mview_timestamp)"
+  printf '[%s] %s\n' "$timestamp" "$*"
+  if [[ -n "${MVIEW_RUNNER_LOG:-}" ]]; then
+    printf '[%s] %s\n' "$timestamp" "$*" >> "$MVIEW_RUNNER_LOG"
+  fi
+}
+
+mview_append_status() {
+  local event="$1"
+  local workload="$2"
+  local nemesis="$3"
+  local time_limit="$4"
+  local exit_code="${5:-}"
+  local store_dirs="${6:-}"
+  local case_log="${7:-}"
+
+  mview_init_suite_outputs
+  if [[ -z "${MVIEW_STATUS_TSV:-}" ]]; then
+    return 0
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(mview_tsv_escape "$(mview_timestamp)")" \
+    "$(mview_tsv_escape "$event")" \
+    "$(mview_tsv_escape "$workload")" \
+    "$(mview_tsv_escape "$nemesis")" \
+    "$(mview_tsv_escape "$time_limit")" \
+    "$(mview_tsv_escape "$exit_code")" \
+    "$(mview_tsv_escape "$store_dirs")" \
+    "$(mview_tsv_escape "$case_log")" \
+    "$(mview_tsv_escape "${TARBALL_URL:-}")" \
+    "$(mview_tsv_escape "${BINARY_URLS:-}")" \
+    >> "$MVIEW_STATUS_TSV"
+}
+
+mview_join_csv() {
+  local IFS=','
+  printf '%s' "$*"
+}
+
 mview_run_suite_cases() {
   local suite="$1"
   local workload_filter="${2:-${WORKLOAD_FILTER:-}}"
+  mview_init_suite_outputs
+  mview_log_progress "suite cases start suite=$suite workload_filter=${workload_filter:-all}"
   while IFS=$'\t' read -r workload nemesis time_limit; do
     [[ -z "$workload" ]] && continue
     mview_run_test "$workload" "$nemesis" "$time_limit"
   done < <(mview_emit_suite_cases "$suite" "$workload_filter")
+  mview_log_progress "suite cases done suite=$suite workload_filter=${workload_filter:-all}"
 }
 
 mview_run_test() {
   local workload="$1"
   local nemesis="$2"
   local time_limit="$3"
-  echo "==> ${workload} / ${nemesis} / ${time_limit}s"
-  lein run test     --workload "$workload"     --nemesis "$nemesis"     --time-limit "$time_limit"     --test-count 1     --concurrency "$CONCURRENCY"     --auto-retry default     --auto-retry-limit default     --txn-mode "$TXN_MODE"     --tarball-url "$TARBALL_URL"     --ssh-private-key "$SSH_PRIVATE_KEY"     "${MVIEW_BUILD_ARGS[@]}"
+  local before_file=""
+  local after_file=""
+  local case_log=""
+  local store_dirs_csv=""
+  local case_slug=""
+  local exit_code=0
+  local -a store_dirs=()
+  local -a cmd=(
+    lein run test
+    --workload "$workload"
+    --nemesis "$nemesis"
+    --time-limit "$time_limit"
+    --test-count 1
+    --concurrency "$CONCURRENCY"
+    --auto-retry default
+    --auto-retry-limit default
+    --txn-mode "$TXN_MODE"
+    --tarball-url "$TARBALL_URL"
+    --ssh-private-key "$SSH_PRIVATE_KEY"
+  )
+
+  if [[ ${#MVIEW_BUILD_ARGS[@]} -gt 0 ]]; then
+    cmd+=("${MVIEW_BUILD_ARGS[@]}")
+  fi
+
+  mview_init_suite_outputs
+  if [[ -n "${MVIEW_SUITE_OUTPUT_DIR:-}" ]]; then
+    before_file="$(mktemp)"
+    after_file="$(mktemp)"
+    mview_list_store_dirs > "$before_file"
+    case_slug="$(mview_safe_name "${workload}__${nemesis}")"
+    case_log="$MVIEW_CASE_LOG_DIR/${case_slug}.log"
+    : > "$case_log"
+  fi
+
+  mview_log_progress "case start workload=$workload nemesis=$nemesis time_limit=${time_limit}s tarball=${TARBALL_URL:-} binary_urls=${BINARY_URLS:-none}"
+  mview_append_status "start" "$workload" "$nemesis" "$time_limit" "" "" "$case_log"
+
+  if [[ -n "$case_log" ]]; then
+    if "${cmd[@]}" 2>&1 | tee -a "$case_log"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+  else
+    if "${cmd[@]}"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+  fi
+
+  if [[ -n "$after_file" ]]; then
+    mview_list_store_dirs > "$after_file"
+    while IFS= read -r store_dir; do
+      [[ -z "$store_dir" ]] && continue
+      store_dirs+=("$store_dir")
+    done < <(mview_diff_store_dirs "$before_file" "$after_file")
+    if [[ ${#store_dirs[@]} -gt 0 ]]; then
+      store_dirs_csv="$(mview_join_csv "${store_dirs[@]}")"
+    fi
+  fi
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    mview_log_progress "case passed workload=$workload nemesis=$nemesis store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
+    mview_append_status "passed" "$workload" "$nemesis" "$time_limit" "$exit_code" "$store_dirs_csv" "$case_log"
+  else
+    mview_log_progress "case failed workload=$workload nemesis=$nemesis exit_code=$exit_code store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
+    mview_append_status "failed" "$workload" "$nemesis" "$time_limit" "$exit_code" "$store_dirs_csv" "$case_log"
+  fi
+
+  [[ -n "$before_file" ]] && rm -f "$before_file"
+  [[ -n "$after_file" ]] && rm -f "$after_file"
+
+  return "$exit_code"
 }
 
 mview_latest_store_dir() {

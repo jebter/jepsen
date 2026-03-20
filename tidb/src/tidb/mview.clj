@@ -66,7 +66,9 @@
                     (map #(str "(" % ")"))
                     (str/join ","))]
     (when-not (str/blank? splits)
-      (c/execute! conn [(str "split table " base-table " by " splits)]))))
+      (execute-safely! conn
+                       (str "split table " base-table " by " splits)
+                       "Ignoring unsupported split-table syntax:"))))
 
 (defn create-mlog!
   [conn]
@@ -152,6 +154,13 @@
      (re-find #"lock\(s\) could not be acquired immediately|NOWAIT is set"
               message))))
 
+(defn- missing-object-error?
+  [^java.sql.SQLException e]
+  (let [message (str (.getMessage e))]
+    (boolean
+     (re-find #"(?i)(\[(schema|planner):1146\].*doesn't exist|unknown table|unknown view|unknown materialized view|table '.*' doesn't exist)"
+              message))))
+
 (defn- try-statements-once!
   [conn label statements]
   (loop [remaining statements
@@ -161,7 +170,8 @@
                      {:stmt (do (c/execute! conn [stmt]) stmt)}
                      (catch java.sql.SQLException e
                        (info label (.getMessage e) "stmt=" stmt)
-                       (if (refresh-lock-conflict? e)
+                       (if (or (refresh-lock-conflict? e)
+                               (missing-object-error? e))
                          (throw e)
                          {:error e})))]
         (if-let [ok-stmt (:stmt result)]
@@ -196,10 +206,8 @@
   (try-statements!
    conn
    (str "Refresh failed for " view)
-   [(str "REFRESH MATERIALIZED VIEW " view " WITH SYNC MODE FAST")
-    (str "REFRESH MATERIALIZED VIEW " view " FAST WITH SYNC MODE")
-    (str "REFRESH MATERIALIZED VIEW " view " WITH SYNC MODE")
-    (str "REFRESH MATERIALIZED VIEW " view)]))
+   [(str "REFRESH MATERIALIZED VIEW " view " FAST")
+    (str "REFRESH MATERIALIZED VIEW " view " COMPLETE")]))
 
 (defn purge-log!
   [conn]

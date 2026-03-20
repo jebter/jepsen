@@ -173,10 +173,21 @@
   [dt]
   (sleep-til-nanos (+ dt (System/nanoTime))))
 
+(defn sleep-nanos-interruptibly
+  "High-resolution sleep which throws InterruptedException when interrupted."
+  [dt]
+  (let [deadline (+ dt (System/nanoTime))]
+    (loop []
+      (when (Thread/interrupted)
+        (throw (InterruptedException.)))
+      (when (< (+ (System/nanoTime) 10000) deadline)
+        (LockSupport/parkNanos (- deadline (System/nanoTime)))
+        (recur)))))
+
 (defgenerator DelayFn [f gen]
   [f gen]
   (op [_ test process]
-      (Thread/sleep (* 1000 (f)))
+      (sleep-nanos-interruptibly (long (* 1e9 (double (f)))))
       (op gen test process)))
 
 (defn delay-fn
@@ -212,6 +223,8 @@
   ([anchor dt now]
    (+ now (- dt (mod (- now anchor) dt)))))
 
+(declare clear-time-limit-interrupt!)
+
 (defgenerator DelayTil
   [dt precache? anchor gen]
   [(util/nanos->secs dt) precache? gen]
@@ -219,6 +232,9 @@
      (if precache?
        (let [op (op gen test process)]
          (sleep-til-nanos (next-tick-nanos anchor dt))
+         ; If a time-limit interrupted this precached delay, the op is already
+         ; determined and should still be delivered.
+         (clear-time-limit-interrupt!)
          op)
        (do (sleep-til-nanos (next-tick-nanos anchor dt))
            (op gen test process)))))
@@ -501,6 +517,20 @@
 ; We'll set up a *global* lock on the time-limit fn, and use the thread set to
 ; make sure no other time-limit can interrupt a worker while the others are
 ; triggering.
+(def ^:private time-limit-interrupted-threads
+  (atom #{}))
+
+(defn clear-time-limit-interrupt!
+  "Clears a stale interrupt on the current thread when it was introduced by a
+  generator time-limit, but the interrupted operation handled that exception
+  itself before control returned to the worker loop."
+  []
+  (let [thread (Thread/currentThread)]
+    (when (contains? @time-limit-interrupted-threads thread)
+      (Thread/interrupted)
+      (swap! time-limit-interrupted-threads disj thread)
+      true)))
+
 (declare time-limit)
 (defgenerator TimeLimit [dt                 ; Time interval
                          source             ; Underlying generator
@@ -526,6 +556,7 @@
                                            ; Interrupt those threads
                                            (locking threads
                                              (doseq [t @threads]
+                                               (swap! time-limit-interrupted-threads conj t)
                                                (.interrupt t)))
 
                                            ; Wait for interrupt processing to
@@ -543,7 +574,25 @@
           (try
             (swap! threads conj (Thread/currentThread))
             ; Grab an operation from the underlying generator
-            (op source test process)
+            (let [thread (Thread/currentThread)
+                  op'    (op source test process)]
+              ; If our deadline fired while source was on its way out, the
+              ; interrupt can leak past source and poison the next client op.
+              ; Remove ourselves from the active set while holding the same
+              ; lock as the deadline thread. If source returns with our own
+              ; interrupt still pending, drop the late op and clear the stale
+              ; interrupt; otherwise allow the op through.
+              (locking threads
+                (swap! threads disj thread)
+                (let [ours?        (contains? @time-limit-interrupted-threads thread)
+                      interrupted? (.isInterrupted thread)]
+                  (when ours?
+                    (swap! time-limit-interrupted-threads disj thread))
+                  (if (and ours? interrupted?)
+                    (do
+                      (Thread/interrupted)
+                      nil)
+                    op'))))
             (finally
               (locking threads
                 (swap! threads disj (Thread/currentThread))))))
@@ -555,7 +604,10 @@
           (locking threads
             (swap! threads disj (Thread/currentThread)))
           (if @interrupted?
-            nil
+            (do (swap! time-limit-interrupted-threads
+                       disj
+                       (Thread/currentThread))
+                nil)
             (throw sea-lion)))
 
         ; Ugh this is SUCH a special case thing but BrokenBarrier is also a
@@ -564,7 +616,10 @@
           (locking threads
             (swap! threads disj (Thread/currentThread)))
           (if @interrupted?
-            nil
+            (do (swap! time-limit-interrupted-threads
+                       disj
+                       (Thread/currentThread))
+                nil)
             (throw sea-lion))))))
 
 (defn time-limit
@@ -708,15 +763,23 @@
 (defgenerator Synchronize [gen state]
   [@state gen]
   (op [_ test process]
-    (when (not= :clear @state)
-      ; Ensure a barrier exists
-      (compare-and-set! state :fresh
-                        (CyclicBarrier. (count *threads*)
-                                        (partial reset! state :clear)))
+    (let [sync-result
+          (when (not= :clear @state)
+            ; Ensure a barrier exists
+            (compare-and-set! state :fresh
+                              (CyclicBarrier. (count *threads*)
+                                              (partial reset! state :clear)))
 
-      ; Block on barrier
-      (.await ^CyclicBarrier @state))
-    (op gen test process)))
+            ; Block on barrier
+            (try
+              (.await ^CyclicBarrier @state)
+              :ok
+              (catch InterruptedException _
+                ::interrupted)
+              (catch BrokenBarrierException _
+                ::interrupted)))]
+      (when (not= ::interrupted sync-result)
+        (op gen test process)))))
 
 (defn synchronize
   "Blocks until all nodes are blocked awaiting operations from this generator,

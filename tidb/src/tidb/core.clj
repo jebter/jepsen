@@ -66,6 +66,38 @@
    :sequential      sequential/workload
    :table           table/workload})
 
+(def network-nemesis-keys
+  "Nemesis types which require a real network implementation."
+  #{:partition
+    :partition-one
+    :partition-pd-leader
+    :partition-half
+    :partition-ring
+    :netem})
+
+(defn best-effort-net?
+  []
+  (contains? #{"1" "true" "yes"}
+             (some-> (System/getenv "JEPSEN_BEST_EFFORT_NET")
+                     str/lower-case)))
+
+(defn test-net
+  "Select the runtime network implementation for this test."
+  [opts]
+  (let [nemesis-spec (:nemesis opts)]
+    (if (and (best-effort-net?)
+             (not-any? #(get nemesis-spec %)
+                       network-nemesis-keys))
+      (do (info "Using net/noop because JEPSEN_BEST_EFFORT_NET is enabled and nemesis does not need network faults")
+          net/noop)
+      (:net tests/noop-test))))
+
+(defn requires-real-network?
+  [opts]
+  (boolean
+   (some #(get (:nemesis opts) %)
+         network-nemesis-keys)))
+
 (def workload-options
   "For each workload, a map of workload options to all values that option
   supports."
@@ -383,6 +415,8 @@
            (dissoc workload :final-generator)
            {:name         name
             :db           (db/db)
+            :net          (test-net opts)
+            :requires-real-network? (requires-real-network? opts)
             :client       (:client workload)
             :nemesis-spec nemesis-spec
             :nemesis      (:nemesis nemesis)

@@ -24,6 +24,44 @@
 (def group-count 4)
 (def write-fns [:insert :update-value :update-value :move-group :delete])
 
+(defonce autosched-schema-setup-by-test
+  (atom {}))
+
+(defn setup-key
+  [test]
+  [(or (:name test) ::unnamed-test)
+   (or (some-> (:start-time test) str)
+       (System/identityHashCode test))])
+
+(defn setup-schema-once!
+  [test f]
+  (let [k (setup-key test)]
+    (loop []
+      (let [[mode setup-promise]
+            (locking autosched-schema-setup-by-test
+              (if-let [setup-promise (get @autosched-schema-setup-by-test k)]
+                [:wait setup-promise]
+                (let [setup-promise (promise)]
+                  (swap! autosched-schema-setup-by-test assoc k setup-promise)
+                  [:run setup-promise])))]
+        (case mode
+          :run
+          (try
+            (let [setup (f)]
+              (deliver setup-promise {:ok setup})
+              setup)
+            (catch Throwable t
+              (locking autosched-schema-setup-by-test
+                (swap! autosched-schema-setup-by-test dissoc k))
+              (deliver setup-promise {:error t})
+              (throw t)))
+
+          :wait
+          (let [{:keys [ok error]} @setup-promise]
+            (if error
+              (throw error)
+              ok)))))))
+
 (defn process-id
   [process]
   (cond
@@ -103,14 +141,20 @@
                    stack))]
     (or (instance? java.sql.SQLTimeoutException t)
         (instance? java.sql.SQLNonTransientConnectionException t)
+        (some #(instance? java.sql.BatchUpdateException %) chain)
+        (some #(instance? java.sql.SQLTransientException %) chain)
+        (some #(instance? InterruptedException %) chain)
         (= :connect-timed-out type)
         driver-batch-npe?
-        (re-find #"timed(?: |-)?out|Connection is closed|closed connection|Connection reset|broken pipe|Socket" message))))
+        (re-find #"Interrupted awaiting response|timed(?: |-)?out|Connection is closed|closed connection|Connection reset|broken pipe|Socket" message))))
 
 (defn retryable-write-error?
   [t]
   (or (ambiguous-write-error? t)
       (instance? NullPointerException t)))
+
+(def op-timeout-ms
+  (+ c/socket-timeout 5000))
 
 (defn setup-retryable-error?
   [t]
@@ -121,9 +165,31 @@
 
 (defn close-conn-holder!
   [conn-holder]
-  (when-let [conn @conn-holder]
-    (c/close! conn))
-  (reset! conn-holder nil))
+  (loop []
+    (when-let [conn @conn-holder]
+      (if (compare-and-set! conn-holder conn nil)
+        (c/abort! conn)
+        (recur)))))
+
+(defn run-with-op-timeout!
+  [conn-holder node f]
+  (let [worker (future
+                 (try
+                   {:ok (f)}
+                   (catch Throwable t
+                     {:error t})))
+        result (deref worker op-timeout-ms ::timeout)]
+    (if (= ::timeout result)
+      (do
+        (close-conn-holder! conn-holder)
+        (future-cancel worker)
+        (throw (ex-info (str "operation timed out after " op-timeout-ms " ms")
+                        {:type :op-timed-out
+                         :node node
+                         :timeout-ms op-timeout-ms})))
+      (if-let [t (:error result)]
+        (throw t)
+        (:ok result)))))
 
 (defn ensure-conn!
   [conn-holder node test]
@@ -135,7 +201,7 @@
   (loop [tries 3]
     (let [result (try
                    (let [conn (ensure-conn! conn-holder node test)]
-                     {:ok (f conn)})
+                     {:ok (run-with-op-timeout! conn-holder node #(f conn))})
                    (catch Throwable t
                      {:error t}))]
       (if-let [t (:error result)]
@@ -388,20 +454,22 @@
       (assoc this :conn-holder conn-holder' :node node)))
 
   (setup! [this test]
-    (when (compare-and-set! schema-created? false true)
-      (let [ids (map key-for-process
-                     (range (long (max 1 (:concurrency test)))))
-            setup (with-reconnect! conn-holder node test setup-retryable-error?
+    (let [ids (map key-for-process
+                   (range (long (max 1 (:concurrency test)))))
+          setup (setup-schema-once!
+                 test
+                 #(with-reconnect! conn-holder node test setup-retryable-error?
                     (fn [conn]
-                    (mv/setup-autosched-schema!
-                     conn
-                     ids
-                     {:refresh-start-delay refresh-start-delay
-                      :row-refresh-seconds row-refresh-seconds
-                      :agg-refresh-seconds agg-refresh-seconds
-                      :purge-start-delay   purge-start-delay
-                      :purge-next-seconds  purge-next-seconds})))]
-        (reset! schedule-meta setup)))
+                      (mv/setup-autosched-schema!
+                       conn
+                       ids
+                       {:refresh-start-delay refresh-start-delay
+                        :row-refresh-seconds row-refresh-seconds
+                        :agg-refresh-seconds agg-refresh-seconds
+                        :purge-start-delay   purge-start-delay
+                        :purge-next-seconds  purge-next-seconds}))))]
+      (reset! schema-created? true)
+      (reset! schedule-meta setup))
     this)
 
   (invoke! [_ test op]
@@ -437,17 +505,31 @@
                                        ok-snapshots)
             purge-progress-state (purge-progress ok-snapshots)
             purge-progress-ok?   (not= false purge-progress-state)
-            snapshot-values      (mapv snapshot-result ok-snapshots)]
-        (let [summary {:valid?                    (and (empty? unresolved-writes)
-                                                       (empty? snapshot-failures)
-                                                       (boolean stable-pair)
-                                                       refresh-progress?
-                                                       purge-progress-ok?)
+            snapshot-values      (mapv snapshot-result ok-snapshots)
+            unresolved-write-count (count unresolved-writes)
+            snapshot-valid?      (empty? snapshot-failures)
+            quiet-stable?        (boolean stable-pair)
+            refresh-converged?   (boolean refresh-progress?)
+            write-resolution-valid? (zero? unresolved-write-count)
+            autosched-converged? (and snapshot-valid?
+                                      quiet-stable?
+                                      refresh-converged?
+                                      purge-progress-ok?)
+            strict-valid?        (and autosched-converged?
+                                      write-resolution-valid?)]
+        (let [summary {:valid?                    strict-valid?
+                       :strict-valid?             strict-valid?
+                       :autosched-converged?      autosched-converged?
+                       :write-resolution-valid?   write-resolution-valid?
+                       :recovered-write-ambiguity? (and (not write-resolution-valid?)
+                                                        autosched-converged?)
+                       :snapshot-valid?           snapshot-valid?
                        :write-count               (count write-ops)
+                       :unresolved-write-count    unresolved-write-count
                        :snapshot-count            (count snapshot-ops)
                        :snapshot-fail-count       (count snapshot-failures)
-                       :stable-after-quiet?       (boolean stable-pair)
-                       :post-fault-refresh?       (boolean refresh-progress?)
+                       :stable-after-quiet?       quiet-stable?
+                       :post-fault-refresh?       refresh-converged?
                        :post-fault-purge          purge-progress-state
                        :snapshot-path             "mv-autosched/snapshots.edn"
                        :snapshot-json-path        "mv-autosched/snapshots.json"

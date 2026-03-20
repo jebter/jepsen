@@ -65,16 +65,24 @@
   resolution and other network errors, and retries them. EC2 name resolution
   can be surprisingly flaky."
   [& args]
-  (loop [tries 5]
-    (let [res (try+
-                (exec :wget args)
-                (catch [:type :jepsen.control/nonzero-exit, :exit 4] e
-                  (if (pos? tries)
-                    ::retry
-                    (throw e))))]
-      (if (= ::retry res)
-        (recur (dec tries))
-        res))))
+  (let [url          (last args)
+        max-retries  5]
+    (loop [tries max-retries
+           attempt 1]
+      (let [res (try+
+                  (exec :wget args)
+                  (catch [:type :jepsen.control/nonzero-exit, :exit 4] e
+                    (if (pos? tries)
+                      (do (warn "jepsen.install" {:stage :download-retry
+                                                  :url url
+                                                  :attempt attempt
+                                                  :retries-left tries
+                                                  :exit (:exit e)})
+                          ::retry)
+                      (throw e))))]
+        (if (= ::retry res)
+          (recur (dec tries) (inc attempt))
+          res)))))
 
 (defn wget!
   "Downloads a string URL and returns the filename as a string. Skips if the
@@ -93,6 +101,20 @@
   "Directory for caching files from the web."
   (str tmp-dir-base "/wget-cache"))
 
+(defn elapsed-ms
+  [started-at]
+  (long (/ (double (- (System/nanoTime) started-at)) 1000000.0)))
+
+(defn install-log
+  [stage fields]
+  (info "jepsen.install" (merge {:stage stage} fields)))
+
+(defn rethrow-any!
+  [e]
+  (if (instance? Throwable e)
+    (throw e)
+    (throw+ e)))
+
 (defn cached-wget!
   "Downloads a string URL to the Jepsen wget cache directory, and returns the
   full local filename as a string. Skips if the file already exists. Local
@@ -106,18 +128,33 @@
 
     :force?     Even if we have this cached, download the tarball again anyway."
   ([url]
-   (wget! url {:force? false}))
+   (cached-wget! url {:force? false}))
   ([url opts]
    (let [encoded-url (String. (b64/encode (.getBytes url)) "UTF-8")
          dest-file   (str wget-cache-dir "/" encoded-url)]
      (when (:force? opts)
-       (info "Clearing cached copy of" url)
+       (install-log :download-cache-cleared {:url url
+                                             :dest-file dest-file})
        (exec :rm :-rf dest-file))
-     (when-not (exists? dest-file)
-       (info "Downloading" url)
-       (do (exec :mkdir :-p wget-cache-dir)
-           (cd wget-cache-dir
-               (wget-helper! std-wget-opts :-O dest-file url))))
+     (if (exists? dest-file)
+       (install-log :download-cache-hit {:url url
+                                         :dest-file dest-file})
+       (let [started-at (System/nanoTime)]
+         (install-log :download-start {:url url
+                                       :dest-file dest-file})
+         (try+
+           (do (exec :mkdir :-p wget-cache-dir)
+               (cd wget-cache-dir
+                   (wget-helper! std-wget-opts :-O dest-file url))
+               (install-log :download-complete {:url url
+                                                :dest-file dest-file
+                                                :elapsed-ms (elapsed-ms started-at)}))
+           (catch Object e
+             (install-log :download-failed {:url url
+                                            :dest-file dest-file
+                                            :failure-bucket :download-failed
+                                            :elapsed-ms (elapsed-ms started-at)})
+             (rethrow-any! e)))))
      dest-file)))
 
 (defn install-archive!
@@ -135,10 +172,17 @@
   ([url dest]
    (install-archive! url dest false))
   ([url dest force?]
-   (let [local-file (nth (re-find #"file://(.+)" url) 1)
-         file       (or local-file (cached-wget! url {:force? force?}))
-         tmpdir     (tmp-dir!)
-         dest       (expand-path dest)]
+   (let [started-at  (System/nanoTime)
+         local-file  (nth (re-find #"file://(.+)" url) 1)
+         file        (or local-file (cached-wget! url {:force? force?}))
+         tmpdir      (tmp-dir!)
+         dest        (expand-path dest)
+         archive-kind (if (re-find #".*\.zip$" url) :zip :tar)]
+
+     (install-log :archive-install-start {:url url
+                                          :dest dest
+                                          :source (if local-file :local-file :cache)
+                                          :archive-kind archive-kind})
 
      ; Clean up old dest and make sure parent directory is ready
      (exec :rm :-rf dest)
@@ -148,10 +192,17 @@
      (try+
        (cd tmpdir
            ; Extract archive to tmpdir
+           (install-log :archive-extract-start {:url url
+                                                :dest dest
+                                                :archive-file file
+                                                :archive-kind archive-kind})
            (if (re-find #".*\.zip$" url)
              (exec :unzip file)
              (exec :tar :--no-same-owner :--no-same-permissions
                    :--extract :--file file))
+           (install-log :archive-extract-complete {:url url
+                                                   :dest dest
+                                                   :archive-file file})
 
            ; Force ownership
            (when (= "root" *sudo*)
@@ -160,6 +211,9 @@
            ; Get archive root paths
            (let [roots (ls)]
              (assert (pos? (count roots)) "Archive contained no files")
+             (install-log :archive-roots-detected {:url url
+                                                   :dest dest
+                                                   :roots roots})
 
              (if (= 1 (count roots))
                ; Move root's contents to dest
@@ -167,6 +221,11 @@
 
                ; Move all roots to dest
                (exec :mv tmpdir dest))))
+
+       (install-log :archive-install-complete {:url url
+                                               :dest dest
+                                               :archive-file file
+                                               :elapsed-ms (elapsed-ms started-at)})
 
        (catch [:type :jepsen.control/nonzero-exit] e
          (let [err (:err e)]
@@ -179,12 +238,29 @@
                              *host*
                              " is corrupt: " err)))
                ; Retry download once; maybe it was abnormally terminated
-               (do (info "Retrying corrupt archive download")
+               (do (install-log :archive-corrupt-download-retry {:url url
+                                                                 :dest dest
+                                                                 :archive-file file
+                                                                 :elapsed-ms (elapsed-ms started-at)})
                    (exec :rm :-rf file)
                    (install-archive! url dest force?)))
 
              ; Throw by default
-             (throw+ e))))
+             (do (install-log :archive-install-failed {:url url
+                                                       :dest dest
+                                                       :archive-file file
+                                                       :failure-bucket :extract-failed
+                                                       :elapsed-ms (elapsed-ms started-at)
+                                                       :exit (:exit e)})
+                 (throw+ e)))))
+
+       (catch Object e
+         (install-log :archive-install-failed {:url url
+                                               :dest dest
+                                               :archive-file file
+                                               :failure-bucket :extract-failed
+                                               :elapsed-ms (elapsed-ms started-at)})
+         (rethrow-any! e))
 
        (finally
          ; Clean up tmpdir
@@ -238,22 +314,25 @@
   :env
   :process-name"
   [opts bin & args]
-  (info "starting" (:process-name opts (.getName (file bin))))
-  (exec :echo (lit "`date +'%Y-%m-%d %H:%M:%S'`")
+  (let [bin (if (and (:chdir opts) (not (.isAbsolute (file bin))))
+              (.getPath (file (:chdir opts) bin))
+              bin)]
+    (info "starting" (:process-name opts (.getName (file bin))))
+    (exec :echo (lit "`date +'%Y-%m-%d %H:%M:%S'`")
         "Jepsen starting" bin (escape args)
         :>> (:logfile opts))
-  (apply exec (map #(lit (str (name (first %)) "=" (escape (second %)))) (:env opts)) :start-stop-daemon :--start
-         (when (:background? opts true) [:--background :--no-close])
-         (when (:make-pidfile? opts true) :--make-pidfile)
-         (when (:match-executable? opts true) [:--exec bin])
-         (when (:match-process-name? opts false)
-           [:--name (:process-name opts (.getName (file bin)))])
-         :--pidfile  (:pidfile opts)
-         :--chdir    (:chdir opts)
-         :--oknodo
-         :--startas  bin
-         :--
-         (concat args [:>> (:logfile opts) (lit "2>&1")])))
+    (apply exec (map #(lit (str (name (first %)) "=" (escape (second %)))) (:env opts)) :start-stop-daemon :--start
+           (when (:background? opts true) [:--background :--no-close])
+           (when (:make-pidfile? opts true) :--make-pidfile)
+           (when (:match-executable? opts true) [:--exec bin])
+           (when (:match-process-name? opts false)
+             [:--name (:process-name opts (.getName (file bin)))])
+           :--pidfile  (:pidfile opts)
+           :--chdir    (:chdir opts)
+           :--oknodo
+           :--startas  bin
+           :--
+           (concat args [:>> (:logfile opts) (lit "2>&1")]))))
 
 (defn stop-daemon!
   "Kills a daemon process by pidfile, or, if given a command name, kills all

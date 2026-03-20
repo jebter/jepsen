@@ -2,13 +2,27 @@
   (:refer-clojure :exclude [set])
   (:use jepsen.checker
         clojure.test)
-  (:require [knossos [history :as history]
+  (:require [clojure.java.shell :as sh]
+            [knossos [history :as history]
              [model :as model]
              [core :refer [ok-op invoke-op fail-op]]
              [op :as op]]
             [multiset.core :as multiset]
             [jepsen.checker.perf :as cp]
             [jepsen.util :as util]))
+
+(def gnuplot-available?
+  (delay
+    (try
+      (zero? (:exit (sh/sh "gnuplot" "--version")))
+      (catch java.io.IOException _
+        false))))
+
+(defmacro with-gnuplot
+  [& body]
+  `(if @gnuplot-available?
+     (do ~@body)
+     (is true "Skipping plot test because gnuplot is unavailable")))
 
 (deftest queue-test
   (testing "empty"
@@ -185,11 +199,12 @@
         0 10  0.0 10
         ; Bigger integers
         1000 10000  1000.0  10000
-        1234  5678  1000.0   6000.0
-        ; Tiny numbers
-        ; I don't like these answers but whatever
-        0.03415 0.03437 0.034140000000000004 0.034370000000000005
-       ))
+        1234  5678  1000.0   6000.0)
+  (testing "tiny numbers remain a non-degenerate superset"
+    (let [[a' b'] (cp/broaden-range [0.03415 0.03437])]
+      (is (<= a' 0.03415))
+      (is (<= 0.03437 b'))
+      (is (< a' b')))))
 
 (deftest bucket-points-test
   (is (= (cp/bucket-points 2
@@ -237,10 +252,11 @@
        (+ time latency)}])))
 
 (deftest perf-test
-  (let [history (->> (repeatedly #(/ 1e9 (inc (rand-int 1000))))
-                     (mapcat perf-gen)
-                     (take 10000)
-                     vec)]
+  (with-gnuplot
+    (let [history (->> (repeatedly #(/ 1e9 (inc (rand-int 1000))))
+                       (mapcat perf-gen)
+                       (take 10000)
+                       vec)]
 
     (testing "can render latency-graph"
       (is (= (check (latency-graph)
@@ -430,20 +446,21 @@
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
-                :valid? true}))))))
+                :valid? true})))))))
 
 (deftest clock-plot-test
-  (check (clock-plot)
-         {:name       "clock plot test"
-          :start-time 0}
-         [{:process :nemesis, :time 500000000,  :clock-offsets {"n1" 2.1}}
-          {:process :nemesis, :time 1000000000, :clock-offsets {"n1" 0
-                                                                "n2" -3.1}}
-          {:process :nemesis, :time 1500000000, :clock-offsets {"n1" 1
-                                                                "n2" -2}}
-          {:process :nemesis, :time 2000000000, :clock-offsets {"n1" 2
-                                                              "n2" -4.1}}]
-         {}))
+  (with-gnuplot
+    (check (clock-plot)
+           {:name       "clock plot test"
+            :start-time 0}
+           [{:process :nemesis, :time 500000000,  :clock-offsets {"n1" 2.1}}
+            {:process :nemesis, :time 1000000000, :clock-offsets {"n1" 0
+                                                                  "n2" -3.1}}
+            {:process :nemesis, :time 1500000000, :clock-offsets {"n1" 1
+                                                                  "n2" -2}}
+            {:process :nemesis, :time 2000000000, :clock-offsets {"n1" 2
+                                                                  "n2" -4.1}}]
+           {})))
 
 (defn history
   "Takes a sequence of operations and adds times and indexes."

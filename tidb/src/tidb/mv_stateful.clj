@@ -17,6 +17,8 @@
 
 (def group-count 4)
 (def write-fns [:insert :update-value :update-value :move-group :delete])
+(def write-op-fns #{:insert :update-value :move-group :delete})
+(def refresh-op-fns #{:refresh-row :refresh-agg})
 
 (defn process-id
   [process]
@@ -114,6 +116,9 @@
   (or (ambiguous-write-error? t)
       (instance? NullPointerException t)))
 
+(def op-timeout-ms
+  (+ c/socket-timeout 5000))
+
 (defn setup-retryable-error?
   [t]
   (let [message (str (.getMessage t))]
@@ -123,9 +128,31 @@
 
 (defn close-conn-holder!
   [conn-holder]
-  (when-let [conn @conn-holder]
-    (c/close! conn))
-  (reset! conn-holder nil))
+  (loop []
+    (when-let [conn @conn-holder]
+      (if (compare-and-set! conn-holder conn nil)
+        (c/abort! conn)
+        (recur)))))
+
+(defn run-with-op-timeout!
+  [conn-holder node f]
+  (let [worker (future
+                 (try
+                   {:ok (f)}
+                   (catch Throwable t
+                     {:error t})))
+        result (deref worker op-timeout-ms ::timeout)]
+    (if (= ::timeout result)
+      (do
+        (close-conn-holder! conn-holder)
+        (future-cancel worker)
+        (throw (ex-info (str "operation timed out after " op-timeout-ms " ms")
+                        {:type :op-timed-out
+                         :node node
+                         :timeout-ms op-timeout-ms})))
+      (if-let [t (:error result)]
+        (throw t)
+        (:ok result)))))
 
 (defn ensure-conn!
   [conn-holder node test]
@@ -142,7 +169,7 @@
   (loop [tries 3]
     (let [result (try
                    (let [conn (ensure-conn! conn-holder node test)]
-                     {:ok (f conn)})
+                     {:ok (run-with-op-timeout! conn-holder node #(f conn))})
                    (catch Throwable t
                      {:error t}))]
       (if-let [t (:error result)]
@@ -368,6 +395,255 @@
   (let [{:keys [type value]} (compare-agg-on-conn! conn)]
     (assoc op :type type :result value)))
 
+(defn- pair-history
+  [history]
+  (second
+   (reduce (fn [[pending pairs] op]
+             (cond
+               (= :invoke (:type op))
+               [(assoc pending (:process op) op) pairs]
+
+               (completed-op? op)
+               (if-let [invoke (get pending (:process op))]
+                 [(dissoc pending (:process op))
+                  (conj pairs {:invoke invoke
+                               :complete op})]
+                 [pending pairs])
+
+               :else
+               [pending pairs]))
+           [{} []]
+           history)))
+
+(defn- write-pair?
+  [pair]
+  (contains? write-op-fns (get-in pair [:complete :f])))
+
+(defn- refresh-pair?
+  [pair]
+  (contains? refresh-op-fns (get-in pair [:complete :f])))
+
+(defn- pair-index
+  [pair key]
+  (:index (key pair)))
+
+(defn- write-value
+  [pair]
+  (get-in pair [:complete :value]))
+
+(defn- write-process
+  [pair]
+  (get-in pair [:complete :process]))
+
+(defn- live-row
+  [{:keys [id g1 v1 version last-token deleted]}]
+  (when (and (some? id) (not deleted))
+    {:id         (long id)
+     :g1         (long g1)
+     :v1         (long v1)
+     :version    (long version)
+     :last-token last-token}))
+
+(defn- row-model
+  [state]
+  (->> state
+       (keep (fn [[id value]]
+               (when-let [row (live-row value)]
+                 [(long id) row])))
+       (into (sorted-map))))
+
+(defn- agg-model
+  [state]
+  (->> state
+       vals
+       (keep live-row)
+       (reduce (fn [groups {:keys [g1 v1]}]
+                 (update groups g1
+                         (fn [row]
+                           (if row
+                             {:g1     g1
+                              :cnt    (inc (:cnt row))
+                              :sum-v1 (+ (:sum-v1 row) v1)
+                              :min-v1 (min (:min-v1 row) v1)
+                              :max-v1 (max (:max-v1 row) v1)}
+                             {:g1     g1
+                              :cnt    1
+                              :sum-v1 v1
+                              :min-v1 v1
+                              :max-v1 v1}))))
+               (sorted-map))))
+
+(defn- refresh-window-state-choices
+  [write-pairs refresh-pair]
+  (let [invoke-index   (pair-index refresh-pair :invoke)
+        complete-index (pair-index refresh-pair :complete)
+        before         (->> write-pairs
+                            (filter #(< (pair-index % :complete) invoke-index))
+                            (sort-by #(pair-index % :complete))
+                            (reduce (fn [state pair]
+                                      (assoc state
+                                             (write-process pair)
+                                             (write-value pair)))
+                                    {}))
+        overlapping    (->> write-pairs
+                            (remove #(< (pair-index % :complete) invoke-index))
+                            (remove #(> (pair-index % :invoke) complete-index))
+                            (sort-by #(pair-index % :invoke))
+                            (group-by write-process))
+        processes      (sort (distinct (concat (keys before)
+                                               (keys overlapping))))]
+    {:overlapping-write-count (reduce + 0 (map count (vals overlapping)))
+     :states
+     (letfn [(step [remaining current]
+               (if-let [process (first remaining)]
+                 (let [base-choice  (get before process)
+                       next-choices (cons base-choice
+                                          (map write-value (get overlapping process [])))]
+                   (mapcat (fn [choice]
+                             (step (rest remaining)
+                                   (if choice
+                                     (assoc current (:id choice) choice)
+                                     current)))
+                           next-choices))
+                 [current]))]
+       (step processes {}))}))
+
+(defn- diff-score
+  [diff]
+  (+ (count (:missing-in-mv diff))
+     (count (:unexpected-in-mv diff))
+     (count (:mismatched diff))
+     (count (:bad-live-cnt diff))
+     (if (contains? diff :expected) 1 0)
+     (if (contains? diff :live-cnt) 1 0)))
+
+(defn- refresh-actual
+  [complete]
+  (let [result (:result complete)]
+    (case (:f complete)
+      :refresh-agg
+      (if (contains? result :actual)
+        (:actual result)
+        ::absent)
+
+      :refresh-row
+      (if (= :all (:value complete))
+        (if (contains? result :actual)
+          (:actual result)
+          ::absent)
+        (cond
+          (contains? result :row)
+          (:row result)
+
+          (contains? (:diff result) :actual)
+          (let [diff   (:diff result)
+                actual (:actual diff)]
+            (cond
+              (nil? actual) nil
+              (map? actual)
+              (cond-> actual
+                (contains? diff :live-cnt) (assoc :live-cnt (:live-cnt diff))
+                (not (contains? diff :live-cnt)) (assoc :live-cnt 1))
+              :else
+              actual))
+
+          :else
+          ::absent))
+
+      ::absent)))
+
+(defn- refresh-expected
+  [complete state]
+  (case (:f complete)
+    :refresh-agg
+    (agg-model state)
+
+    :refresh-row
+    (if (= :all (:value complete))
+      (row-model state)
+      (get (row-model state)
+           (long (or (:value complete)
+                     (key-for-process (:process complete))))))
+
+    nil))
+
+(defn- refresh-diff
+  [complete expected actual]
+  (case (:f complete)
+    :refresh-agg
+    (mv/agg-diff expected actual)
+
+    :refresh-row
+    (if (= :all (:value complete))
+      (mv/full-row-diff expected actual)
+      (mv/row-diff expected actual))
+
+    nil))
+
+(defn- refresh-result-base
+  [complete actual]
+  (case (:f complete)
+    :refresh-agg
+    {:groups (count actual)}
+
+    :refresh-row
+    (if (= :all (:value complete))
+      {:rows (count actual)}
+      {:id  (or (:value complete)
+                (get-in complete [:result :id])
+                (key-for-process (:process complete)))
+       :row actual})
+
+    {}))
+
+(defn- refresh-window-check
+  [refresh-pair write-pairs]
+  (let [complete (:complete refresh-pair)
+        actual   (refresh-actual complete)]
+    (if (= ::absent actual)
+      complete
+      (let [{:keys [states
+                    overlapping-write-count]} (refresh-window-state-choices write-pairs refresh-pair)
+            candidates      (map (fn [state]
+                                   (let [expected (refresh-expected complete state)
+                                         diff     (refresh-diff complete expected actual)]
+                                     {:expected expected
+                                      :diff diff}))
+                                 states)
+            candidate-count (count states)
+            window          {:invoke-index   (pair-index refresh-pair :invoke)
+                             :complete-index (pair-index refresh-pair :complete)}
+            matched         (some #(when-not (seq (:diff %)) %) candidates)]
+        (if matched
+          (assoc complete
+                 :type :ok
+                 :resolved? (when (op/fail? complete) true)
+                 :result (merge (refresh-result-base complete actual)
+                                {:actual actual
+                                 :expected (:expected matched)
+                                 :validation :window-compatible
+                                 :candidate-count candidate-count
+                                 :overlapping-write-count overlapping-write-count
+                                 :window window}))
+          (let [{:keys [expected diff]} (apply min-key #(diff-score (:diff %)) candidates)]
+            (assoc complete
+                   :type :fail
+                   :error :refresh-window-mismatch
+                   :result (merge (refresh-result-base complete actual)
+                                  {:actual actual
+                                   :expected expected
+                                   :diff diff
+                                   :candidate-count candidate-count
+                                   :overlapping-write-count overlapping-write-count
+                                   :window window}))))))))
+
+(defn- validate-refresh-op
+  [write-pairs op-pair]
+  (let [complete (:complete op-pair)]
+    (if (contains? refresh-op-fns (:f complete))
+      (refresh-window-check op-pair write-pairs)
+      complete)))
+
 (defrecord MVStatefulClient [conn-holder node schema-created?]
   client/Client
 
@@ -408,12 +684,25 @@
   []
   (reify checker/Checker
     (check [_ test history _]
-      (let [refresh-row-ops (filter #(and (= :refresh-row (:f %))
-                                          (completed-op? %))
-                                    history)
-            refresh-agg-ops (filter #(and (= :refresh-agg (:f %))
-                                          (completed-op? %))
-                                    history)
+      (let [pairs           (pair-history history)
+            write-pairs     (filter write-pair? pairs)
+            validated-by-index
+            (->> pairs
+                 (filter refresh-pair?)
+                 (map (fn [pair]
+                        [(:index (:complete pair))
+                         (validate-refresh-op write-pairs pair)]))
+                 (into {}))
+            validated-op    (fn [op]
+                              (get validated-by-index (:index op) op))
+            refresh-row-ops (->> history
+                                 (filter #(and (= :refresh-row (:f %))
+                                               (completed-op? %)))
+                                 (map validated-op))
+            refresh-agg-ops (->> history
+                                 (filter #(and (= :refresh-agg (:f %))
+                                               (completed-op? %)))
+                                 (map validated-op))
             purge-ops       (filter #(and (= :purge (:f %))
                                           (completed-op? %))
                                     history)
@@ -434,6 +723,12 @@
             active-agg-failures (filter op/fail? active-agg-ops)
             final-row-failures  (filter op/fail? final-row-ops)
             final-agg-failures  (filter op/fail? final-agg-ops)
+            window-compatible-row-ops (filter #(= :window-compatible
+                                                  (get-in % [:result :validation]))
+                                              refresh-row-ops)
+            window-compatible-agg-ops (filter #(= :window-compatible
+                                                  (get-in % [:result :validation]))
+                                              refresh-agg-ops)
             first-failure   (first failures)
             first-row-failure (first row-failures)
             first-agg-failure (first agg-failures)
@@ -478,6 +773,8 @@
                        :final-refresh-row-fail-count  (count final-row-failures)
                        :final-refresh-agg-ok-count    (count (filter op/ok? final-agg-ops))
                        :final-refresh-agg-fail-count  (count final-agg-failures)
+                       :window-compatible-row-count   (count window-compatible-row-ops)
+                       :window-compatible-agg-count   (count window-compatible-agg-ops)
                        :purge-ok-count            (count (filter op/ok? purge-ops))
                        :purge-fail-count          (count (filter op/fail? purge-ops))
                        :unresolved-write-count    (count unresolved)

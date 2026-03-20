@@ -154,7 +154,8 @@
   (reify checker/Checker
     (check [_ test _ _]
       (try
-        (let [manifest (-> test build-manifest (write-manifest! test))]
+        (let [manifest (build-manifest test)
+              manifest (write-manifest! test manifest)]
           {:valid? true
            :path "build/manifest.edn"
            :json-path "build/manifest.json"

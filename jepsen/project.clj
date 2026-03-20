@@ -27,7 +27,7 @@
   :main jepsen.cli
   :plugins [[lein-localrepo "0.5.4"]
             [lein-codox "0.10.3"]]
-  :jvm-opts ["-Xmx32g" "-XX:+UseConcMarkSweepGC" "-XX:+UseParNewGC"
+  :jvm-opts ["-Xmx32g" "-XX:+IgnoreUnrecognizedVMOptions" "-XX:+UseConcMarkSweepGC" "-XX:+UseParNewGC"
              "-XX:+CMSParallelRemarkEnabled" "-XX:+AggressiveOpts"
              "-XX:+UseFastAccessorMethods" "-server"]
   :test-selectors {:default (fn [m]
@@ -39,7 +39,7 @@
           :source-uri "https://github.com/jepsen-io/jepsen/blob/{version}/jepsen/{filepath}#L{line}"
           :metadata {:doc/format :markdown}}
   :profiles {:uberjar {:aot :all}
-             :dev {:jvm-opts ["-Xmx32g" "-XX:+UseConcMarkSweepGC"
+             :dev {:jvm-opts ["-Xmx32g" "-XX:+IgnoreUnrecognizedVMOptions" "-XX:+UseConcMarkSweepGC"
                               "-XX:+UseParNewGC"
                               "-XX:+CMSParallelRemarkEnabled"
                               "-XX:+AggressiveOpts"

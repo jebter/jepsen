@@ -172,6 +172,64 @@
                                       (gen/once {:type :invoke, :f :done})))))))
     (is (empty? @conns))))
 
+(deftest ^:integration time-limit-interrupt-does-not-skip-final-phases-test
+  (let [interrupted-generator-op
+        (fn [op]
+          (reify gen/Generator
+            (op [_ _ _]
+              (try
+                (Thread/sleep 1000)
+                op
+                (catch InterruptedException _
+                  (.interrupt (Thread/currentThread))
+                  op)))))
+        client-invocations (atom [])
+        nemesis-invocations (atom [])
+        test (run! (assoc tst/noop-test
+                          :name        "time limit final phases"
+                          :nodes       ["n1"]
+                          :concurrency 2
+                          :ssh         {:dummy? true}
+                          :client (reify client/Client
+                                    (open!  [c t n] c)
+                                    (setup! [c t])
+                                    (invoke! [_ _ op]
+                                      (do (swap! client-invocations
+                                                 conj
+                                                 [(:process op) (:f op)])
+                                          (assoc op :type :ok)))
+                                    (teardown! [c t])
+                                    (close! [c t]))
+                          :nemesis (reify nemesis/Nemesis
+                                     (setup! [n test] n)
+                                     (invoke! [_ _ op]
+                                       (do (swap! nemesis-invocations conj (:f op))
+                                           op))
+                                     (teardown! [n test]))
+                          :checker     (checker/unbridled-optimism)
+                          :generator   (gen/phases
+                                         (gen/time-limit
+                                           0.05
+                                           (gen/nemesis
+                                             (interrupted-generator-op
+                                               {:type :info
+                                                :f    :phase1-nemesis})
+                                             (gen/each
+                                               (interrupted-generator-op
+                                                 {:type :invoke
+                                                  :f    :phase1-client}))))
+                                         (gen/nemesis
+                                           (gen/once {:type :info
+                                                      :f    :phase2-nemesis})
+                                           (gen/each
+                                             (gen/once {:type :invoke
+                                                        :f    :phase2-client}))))))]
+    (is (= #{[0 :phase2-client] [1 :phase2-client]}
+           (set @client-invocations)))
+    (is (= [:phase2-nemesis] @nemesis-invocations))
+    (is (empty? (filter #(= :phase1-client (:f %)) (:history test))))
+    (is (empty? (filter #(= :phase1-nemesis (:f %)) (:history test))))))
+
 (deftest ^:integration worker-error-test
   ; Errors in client and nemesis setup and teardown should be rethrown from
   ; tests.

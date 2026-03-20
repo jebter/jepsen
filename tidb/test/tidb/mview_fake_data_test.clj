@@ -2,10 +2,12 @@
   (:require [clojure.test :refer :all]
             [jepsen.client :as client]
             [jepsen.checker :as checker]
+            [jepsen.control :as control]
             [jepsen.generator :as gen]
             [tidb.mv-autosched :as autosched]
             [tidb.mv-autosched-time :as autosched-time]
             [tidb.artifact :as artifact]
+            [tidb.db :as db]
             [tidb.mv-lifecycle :as lifecycle]
             [tidb.nemesis :as nemesis]
             [tidb.mview :as mv]
@@ -13,18 +15,20 @@
             [tidb.sql :as c]))
 
 (defn snapshot-op
-  [snapshot-at-ms snapshot-node row-hash agg-hash log-row-count]
-  {:type :ok
-   :f :snapshot
-   :process 0
-   :time snapshot-at-ms
-   :value {:snapshot-at-ms snapshot-at-ms
-           :snapshot-node snapshot-node
-           :row-equal? true
-           :agg-equal? true
-           :row-hash row-hash
-           :agg-hash agg-hash
-           :log-row-count log-row-count}})
+  ([snapshot-at-ms snapshot-node row-hash agg-hash log-row-count]
+   (snapshot-op snapshot-at-ms snapshot-node true true row-hash agg-hash log-row-count))
+  ([snapshot-at-ms snapshot-node row-equal? agg-equal? row-hash agg-hash log-row-count]
+   {:type :ok
+    :f :snapshot
+    :process 0
+    :time snapshot-at-ms
+    :value {:snapshot-at-ms snapshot-at-ms
+            :snapshot-node snapshot-node
+            :row-equal? row-equal?
+            :agg-equal? agg-equal?
+            :row-hash row-hash
+            :agg-hash agg-hash
+            :log-row-count log-row-count}}))
 
 (defn time-snapshot-op
   [snapshot-at-ms snapshot-node row-equal? agg-equal? row-hash agg-hash log-row-count]
@@ -93,6 +97,29 @@
         write-pairs  (filter #'tidb.mv-lifecycle/write-pair? pairs)
         refresh-pair (first (filter #'tidb.mv-lifecycle/lifecycle-refresh-pair? pairs))]
     (#'tidb.mv-lifecycle/validate-refresh-op write-pairs refresh-pair)))
+
+(defn stateful-refresh-events
+  [invoke-index complete-index f value complete-type result]
+  [{:type :invoke
+    :f f
+    :process 0
+    :phase :active
+    :index invoke-index
+    :value value}
+   {:type complete-type
+    :f f
+    :process 0
+    :phase :active
+    :index complete-index
+    :value value
+    :result result}])
+
+(defn validate-stateful-refresh-history
+  [history]
+  (let [pairs        (#'tidb.mv-stateful/pair-history history)
+        write-pairs  (filter #'tidb.mv-stateful/write-pair? pairs)
+        refresh-pair (first (filter #'tidb.mv-stateful/refresh-pair? pairs))]
+    (#'tidb.mv-stateful/validate-refresh-op write-pairs refresh-pair)))
 
 (deftest stored-row-matches-checks-full-row-shape
   (let [expected {:id 1 :g1 2 :v1 3 :version 4 :last-token "tok" :deleted false :pad "pad"}
@@ -256,6 +283,39 @@
         (is (= [:old] @closed-calls))
         (is (= new-conn @conn-holder))))))
 
+(deftest stateful-write-retries-when-op-times-out
+  (let [old-conn      {:name :old}
+        new-conn      {:name :new}
+        conn-holder   (atom old-conn)
+        execute-calls (atom [])
+        aborted-calls (atom [])
+        token         "mv-stateful-op-timeout-token"
+        op            {:type :invoke
+                       :f :update-value
+                       :value {:id 1
+                               :g1 2
+                               :v1 3
+                               :version 4
+                               :last-token token
+                               :deleted false
+                               :pad (stateful/pad-for token)}}]
+    (with-redefs [stateful/op-timeout-ms 20
+                  c/execute!            (fn [conn _ _]
+                                          (swap! execute-calls conj (:name conn))
+                                          (when (= conn old-conn)
+                                            (Thread/sleep 1000)))
+                  c/open                (fn [_ _] new-conn)
+                  c/abort!              (fn [conn]
+                                          (swap! aborted-calls conj (:name conn))
+                                          nil)
+                  c/close!              (fn [_]
+                                          (throw (ex-info "close! should not be called" {})))]
+      (let [result (stateful/apply-write-with-reconnect! conn-holder :node {} op)]
+        (is (= :ok (:type result)))
+        (is (= [:old :new] @execute-calls))
+        (is (= [:old] @aborted-calls))
+        (is (= new-conn @conn-holder))))))
+
 (deftest stateful-verify-write-falls-back-to-other-nodes
   (let [token       "mv-stateful-verify-fallback-token"
         op          {:type :invoke
@@ -414,6 +474,39 @@
         (is (= [:old] @closed-calls))
         (is (= new-conn @conn-holder))))))
 
+(deftest autosched-write-retries-when-op-times-out
+  (let [old-conn      {:name :old}
+        new-conn      {:name :new}
+        conn-holder   (atom old-conn)
+        execute-calls (atom [])
+        aborted-calls (atom [])
+        token         "mv-autosched-op-timeout-token"
+        op            {:type :invoke
+                       :f :move-group
+                       :value {:id 1
+                               :g1 2
+                               :v1 3
+                               :version 4
+                               :last-token token
+                               :deleted false
+                               :pad (autosched/pad-for token)}}]
+    (with-redefs [autosched/op-timeout-ms 20
+                  c/execute!             (fn [conn _ _]
+                                           (swap! execute-calls conj (:name conn))
+                                           (when (= conn old-conn)
+                                             (Thread/sleep 1000)))
+                  c/open                 (fn [_ _] new-conn)
+                  c/abort!               (fn [conn]
+                                           (swap! aborted-calls conj (:name conn))
+                                           nil)
+                  c/close!               (fn [_]
+                                           (throw (ex-info "close! should not be called" {})))]
+      (let [result (autosched/apply-write-with-reconnect! conn-holder :node {} op)]
+        (is (= :ok (:type result)))
+        (is (= [:old :new] @execute-calls))
+        (is (= [:old] @aborted-calls))
+        (is (= new-conn @conn-holder))))))
+
 (deftest autosched-client-open-retries-when-open-times-out
   (let [old-conn     {:name :old}
         new-conn     {:name :new}
@@ -437,6 +530,41 @@
         (is (not (identical? conn-holder (:conn-holder opened))))
         (is (nil? @conn-holder))
         (is (= new-conn @(-> opened :conn-holder)))))))
+
+(deftest autosched-client-setup-runs-once-per-test-across-distinct-clients
+  (let [setup-state  (atom {})
+        setup-calls  (atom [])
+        setup-result {:row-refresh-stmt "row"
+                      :agg-refresh-stmt "agg"
+                      :purge-schedule-stmt "purge"}
+        test         {:name "mv-autosched-setup-once"
+                      :start-time "20260316T000000.000Z"
+                      :concurrency 5}
+        client-a     (autosched/->MVAutoschedClient (atom nil) :n1 (atom false) (atom nil))
+        client-b     (autosched/->MVAutoschedClient (atom nil) :n2 (atom false) (atom nil))]
+    (with-redefs [autosched/autosched-schema-setup-by-test setup-state
+                  autosched/with-reconnect!
+                  (fn [_ node _ _ f]
+                    (f {:node node}))
+                  mv/setup-autosched-schema!
+                  (fn [conn ids opts]
+                    (swap! setup-calls conj {:conn conn :ids ids :opts opts})
+                    setup-result)]
+      (let [configured-a (client/setup! client-a test)
+            configured-b (client/setup! client-b test)]
+        (is (= 1 (count @setup-calls)))
+        (is (= {:conn {:node :n1}
+                :ids [1 2 3 4 5]
+                :opts {:refresh-start-delay autosched/refresh-start-delay
+                       :row-refresh-seconds autosched/row-refresh-seconds
+                       :agg-refresh-seconds autosched/agg-refresh-seconds
+                       :purge-start-delay autosched/purge-start-delay
+                       :purge-next-seconds autosched/purge-next-seconds}}
+               (first @setup-calls)))
+        (is (true? @(-> configured-a :schema-created?)))
+        (is (true? @(-> configured-b :schema-created?)))
+        (is (= setup-result @(-> configured-a :schedule-meta)))
+        (is (= setup-result @(-> configured-b :schedule-meta)))))))
 
 (deftest autosched-verify-write-falls-back-to-other-nodes
   (let [token       "mv-autosched-verify-fallback-token"
@@ -578,6 +706,55 @@
             [(snapshot-op 0 "n1" 1 1 5)
              (snapshot-op 1 "n2" 1 1 8)
              (snapshot-op 2 "n1" 1 1 3)])))))
+
+(deftest autosched-checker-separates-write-ambiguity-from-convergence
+  (let [unresolved-write {:type :info
+                          :f :update-value
+                          :process 2
+                          :time 42
+                          :value {:id 3
+                                  :g1 3
+                                  :v1 300042
+                                  :version 42
+                                  :last-token "mv-autosched-test-42"
+                                  :deleted false
+                                  :pad (autosched/pad-for "mv-autosched-test-42")}
+                          :error :indeterminate-write
+                          :exception "Query timed out"}
+        summary          (checker/check (autosched/checker*)
+                                        {}
+                                        [unresolved-write
+                                         (snapshot-op 0 "n1" 10 20 5)
+                                         (snapshot-op 1 "n1" 10 20 0)]
+                                        nil)]
+    (is (false? (:valid? summary)))
+    (is (true? (:autosched-converged? summary)))
+    (is (false? (:strict-valid? summary)))
+    (is (false? (:write-resolution-valid? summary)))
+    (is (true? (:recovered-write-ambiguity? summary)))
+    (is (true? (:snapshot-valid? summary)))
+    (is (= 1 (:unresolved-write-count summary)))
+    (is (= unresolved-write (:first-unresolved-write summary)))
+    (is (true? (:stable-after-quiet? summary)))
+    (is (true? (:post-fault-refresh? summary)))
+    (is (= :decreased (:post-fault-purge summary)))))
+
+(deftest autosched-checker-still-fails-when-quiet-phase-does-not-converge
+  (let [summary (checker/check (autosched/checker*)
+                               {}
+                               [(snapshot-op 0 "n1" false false 10 20 5)
+                                (snapshot-op 1 "n1" false false 11 21 5)]
+                               nil)]
+    (is (false? (:valid? summary)))
+    (is (false? (:autosched-converged? summary)))
+    (is (false? (:strict-valid? summary)))
+    (is (true? (:write-resolution-valid? summary)))
+    (is (false? (:recovered-write-ambiguity? summary)))
+    (is (true? (:snapshot-valid? summary)))
+    (is (= 0 (:unresolved-write-count summary)))
+    (is (false? (:stable-after-quiet? summary)))
+    (is (false? (:post-fault-refresh? summary)))
+    (is (= false (:post-fault-purge summary)))))
 
 (deftest schedule-ddl-uses-datetime-next-expression
   (let [calls (atom [])
@@ -1067,6 +1244,58 @@
     (is (= {:invoke-index 3 :complete-index 4}
            (get-in validated [:result :window])))))
 
+(deftest stateful-refresh-window-validation-allows-overlapping-row-write-to-be-excluded
+  (let [history (vec
+                 (concat
+                  (lifecycle-write-events
+                   1 2 1 :update-value
+                   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5" :deleted false :pad "pad-v5"})
+                  (stateful-refresh-events
+                   3 6 :refresh-row 2 :fail
+                   {:id 2
+                    :diff {:expected {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6"}
+                           :actual   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5"}}})
+                  (lifecycle-write-events
+                   4 5 1 :update-value
+                   {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6" :deleted false :pad "pad-v6"})))
+        validated (validate-stateful-refresh-history history)]
+    (is (= :ok (:type validated)))
+    (is (true? (:resolved? validated)))
+    (is (= :window-compatible (get-in validated [:result :validation])))
+    (is (= 2 (get-in validated [:result :candidate-count])))
+    (is (= 1 (get-in validated [:result :overlapping-write-count])))))
+
+(deftest stateful-refresh-window-validation-allows-overlapping-agg-write-to-be-excluded
+  (let [history (vec
+                 (concat
+                  (lifecycle-write-events
+                   1 2 3 :insert
+                   {:id 4 :g1 0 :v1 400013 :version 13 :last-token "tok-4" :deleted false :pad "pad-4"})
+                  (lifecycle-write-events
+                   3 4 2 :insert
+                   {:id 3 :g1 3 :v1 300012 :version 12 :last-token "tok-3" :deleted false :pad "pad-3"})
+                  (stateful-refresh-events
+                   5 8 :refresh-agg nil :fail
+                   {:diff {:mismatched
+                           {2 {:expected {:g1 2 :cnt 1 :sum-v1 200013 :min-v1 200013 :max-v1 200013}
+                               :actual   nil}}}
+                    :expected (sorted-map
+                               0 {:g1 0 :cnt 1 :sum-v1 400013 :min-v1 400013 :max-v1 400013}
+                               2 {:g1 2 :cnt 1 :sum-v1 200013 :min-v1 200013 :max-v1 200013}
+                               3 {:g1 3 :cnt 1 :sum-v1 300012 :min-v1 300012 :max-v1 300012})
+                    :actual (sorted-map
+                             0 {:g1 0 :cnt 1 :sum-v1 400013 :min-v1 400013 :max-v1 400013}
+                             3 {:g1 3 :cnt 1 :sum-v1 300012 :min-v1 300012 :max-v1 300012})})
+                  (lifecycle-write-events
+                   6 7 1 :insert
+                   {:id 2 :g1 2 :v1 200013 :version 13 :last-token "tok-2" :deleted false :pad "pad-2"})))
+        validated (validate-stateful-refresh-history history)]
+    (is (= :ok (:type validated)))
+    (is (true? (:resolved? validated)))
+    (is (= :window-compatible (get-in validated [:result :validation])))
+    (is (= 2 (get-in validated [:result :candidate-count])))
+    (is (= 1 (get-in validated [:result :overlapping-write-count])))))
+
 (deftest stateful-refresh-row-on-conn-keeps-refresh-and-compare-on-one-connection
   (let [conn       {:name :tx}
         op         {:type :invoke :f :refresh-row :value :all}
@@ -1093,6 +1322,99 @@
                 [:mv conn]
                 [:diff base-rows mv-rows]]
                @calls))))))
+
+(deftest mview-refresh-view-stops-fallback-when-object-is-missing
+  (let [stmt  (str "REFRESH MATERIALIZED VIEW " mv/row-view " FAST")
+        calls (atom [])]
+    (with-redefs [c/execute! (fn [_ [passed-stmt] & _]
+                               (swap! calls conj passed-stmt)
+                               (throw (java.sql.SQLException.
+                                       "[schema:1146] Table 'test.mv_stateful_row' doesn't exist")))]
+      (is (thrown-with-msg? java.sql.SQLException
+                            #"mv_stateful_row' doesn't exist"
+                            (mv/refresh-view! ::conn mv/row-view)))
+      (is (= [stmt] @calls)))))
+
+(deftest mview-refresh-view-falls-back-to-complete
+  (let [stmt1 (str "REFRESH MATERIALIZED VIEW " mv/row-view " FAST")
+        stmt2 (str "REFRESH MATERIALIZED VIEW " mv/row-view " COMPLETE")
+        calls (atom [])]
+    (with-redefs [c/execute! (fn [_ [passed-stmt] & _]
+                               (swap! calls conj passed-stmt)
+                               (when (not= stmt2 passed-stmt)
+                                 (throw (java.sql.SQLException.
+                                         "You have an error in your SQL syntax"))))]
+      (is (= stmt2 (mv/refresh-view! ::conn mv/row-view)))
+      (is (= [stmt1 stmt2] @calls)))))
+
+(deftest mview-refresh-view-prefers-fast-statement-when-supported
+  (let [stmt  (str "REFRESH MATERIALIZED VIEW " mv/row-view " FAST")
+        calls (atom [])]
+    (with-redefs [c/execute! (fn [_ [passed-stmt] & _]
+                               (swap! calls conj passed-stmt)
+                               :ok)]
+      (is (= stmt (mv/refresh-view! ::conn mv/row-view)))
+      (is (= [stmt] @calls)))))
+
+(deftest ensure-bin-layout-finishes-interrupted-single-file-normalization
+  (let [root-bin    (str db/tidb-dir ".root-bin")
+        db-bin-path (str db/tidb-dir "/" db/db-bin)
+        present     (atom #{db/tidb-dir root-bin})
+        dirs        (atom #{db/tidb-dir})
+        calls       (atom [])]
+    (with-redefs [jepsen.control.util/exists?
+                  (fn [path]
+                    (contains? @present path))
+                  db/directory?
+                  (fn [path]
+                    (contains? @dirs path))
+                  control/exec
+                  (fn [& args]
+                    (swap! calls conj (vec args))
+                    (case (first args)
+                      :mv
+                      (let [[_ _ src dst] args
+                            src-dir? (contains? @dirs src)]
+                        (swap! present disj src)
+                        (swap! dirs disj src)
+                        (swap! present conj dst)
+                        (when src-dir?
+                          (swap! dirs conj dst)))
+
+                      :mkdir
+                      (let [path (last args)]
+                        (swap! present conj path)
+                        (swap! dirs conj path))
+
+                      :rm
+                      (let [path (last args)]
+                        (swap! present disj path)
+                        (swap! dirs disj path))
+
+                      :ln
+                      (let [path (last args)]
+                        (swap! present conj path))
+                      nil))]
+      (db/ensure-bin-layout!)
+      (is (false? (contains? @present root-bin)))
+      (is (contains? @present db-bin-path))
+      (is (contains? @present db/tidb-bin-dir))
+      (is (some #(= [:mv :-f root-bin db-bin-path] %) @calls))
+      (is (not-any? #(= [:mv :-f db/tidb-dir root-bin] %) @calls))
+      (is (some #(= [:ln :-sf db-bin-path (str db/tidb-bin-dir "/" db/db-bin)] %) @calls)))))
+
+(deftest install-required-reason-detects-broken-tidb-bin-symlink
+  (let [present #{db/tidb-dir}]
+    (with-redefs [jepsen.control.util/exists?
+                  (fn [path]
+                    (contains? present path))
+                  db/path-live?
+                  (fn [path]
+                    (contains? #{(str db/tidb-bin-dir "/" db/pd-bin)
+                                 (str db/tidb-bin-dir "/" db/kv-bin)}
+                               path))]
+      (is (= [:missing-binaries [db/db-bin]]
+             (#'tidb.db/install-required-reason {}))))))
 
 (deftest stateful-checker-trusts-final-refresh-over-intermediate-noise
   (let [history [{:type :ok :f :insert}
@@ -1138,6 +1460,30 @@
     (is (nil? (:first-final-agg-failure summary)))
     (is (= "mv-stateful/first-row-failure.edn" (:first-row-failure-path summary)))
     (is (= "mv-stateful/first-agg-failure.edn" (:first-agg-failure-path summary)))))
+
+(deftest stateful-checker-downgrades-window-compatible-active-failures
+  (let [history (vec
+                 (concat
+                  (lifecycle-write-events
+                   1 2 2 :insert
+                   {:id 3 :g1 3 :v1 300008 :version 8 :last-token "mv-stateful-2-8" :deleted false :pad "pad-v8"})
+                  (stateful-refresh-events
+                   3 6 :refresh-row 3 :fail
+                   {:id 3
+                    :diff {:expected {:id 3 :g1 1 :v1 300009 :version 9 :last-token "mv-stateful-2-9"}
+                           :actual   {:id 3 :g1 3 :v1 300008 :version 8 :last-token "mv-stateful-2-8"}}})
+                  (lifecycle-write-events
+                   4 5 2 :move-group
+                   {:id 3 :g1 1 :v1 300009 :version 9 :last-token "mv-stateful-2-9" :deleted false :pad "pad-v9"})
+                  [{:type :ok :phase :final :f :refresh-row :process 0 :result {:rows 1}}
+                   {:type :ok :phase :final :f :refresh-agg :process 0 :result {:groups 1}}]))
+        summary (checker/check (stateful/checker*) {} history nil)]
+    (is (true? (:valid? summary)))
+    (is (= 0 (:refresh-row-fail-count summary)))
+    (is (= 0 (:active-refresh-row-fail-count summary)))
+    (is (= 1 (:window-compatible-row-count summary)))
+    (is (nil? (:first-row-failure summary)))
+    (is (nil? (:first-failure summary)))))
 
 (deftest stateful-checker-still-fails-when-final-refresh-fails
   (let [history [{:type :ok :phase :final :f :refresh-row :process 0 :result {:rows 1}}
@@ -1292,6 +1638,37 @@
                 :agg-view-present? true
                 :mlog-present? true}
                (get-in result [:result :artifact-state])))))))
+
+(deftest lifecycle-refresh-failure-captures-artifact-state
+  (let [conn-holder (atom {:name :existing})
+        op          {:type :invoke
+                     :f :refresh-row
+                     :lifecycle-phase :baseline-row-refresh}
+        actual      {:base-table-present? true
+                     :row-view-present? false
+                     :agg-view-present? true
+                     :mlog-present? true}]
+    (with-redefs [stateful/with-reconnect!
+                  (fn [_ _ _ _ f]
+                    (if (identical? f mv/artifact-state)
+                      (f ::probe-conn)
+                      (f ::refresh-conn)))
+                  mv/refresh-view!
+                  (fn [_ _]
+                    (throw (java.sql.SQLException.
+                            "[schema:1146] Table 'test.mv_stateful_row' doesn't exist")))
+                  mv/artifact-state
+                  (fn [conn]
+                    (is (= ::probe-conn conn))
+                    actual)]
+      (let [result (#'tidb.mv-lifecycle/lifecycle-refresh-row-with-reconnect!
+                    conn-holder
+                    :n1
+                    {}
+                    op)]
+        (is (= :fail (:type result)))
+        (is (= :refresh-row-error (:error result)))
+        (is (= actual (get-in result [:result :artifact-state])))))))
 
 (deftest lifecycle-transition-recovers-when-artifact-state-already-matches
   (let [op     {:type :invoke
