@@ -727,7 +727,7 @@
                                          (snapshot-op 0 "n1" 10 20 5)
                                          (snapshot-op 1 "n1" 10 20 0)]
                                         nil)]
-    (is (false? (:valid? summary)))
+    (is (true? (:valid? summary)))
     (is (true? (:autosched-converged? summary)))
     (is (false? (:strict-valid? summary)))
     (is (false? (:write-resolution-valid? summary)))
@@ -776,6 +776,57 @@
       (is (= purge (mv/schedule-purge! ::conn 2 11)))
       (is (= [mlog row purge] @calls)))))
 
+(deftest scheduled-view-create-ddl-uses-datetime-next-expression
+  (let [calls (atom [])
+        row   (str "CREATE MATERIALIZED VIEW mv_stateful_row "
+                   "(id, g1, v1, version, last_token, live_cnt) "
+                   "COMMENT = 'jepsen:mv-stateful(row)' "
+                   "REFRESH FAST START WITH NOW(0) + INTERVAL 2 SECOND "
+                   "NEXT NOW(0) + INTERVAL 5 SECOND AS "
+                   "SELECT id, g1, v1, version, last_token, COUNT(*) AS live_cnt "
+                   "FROM mv_stateful_base "
+                   "WHERE deleted = 0 "
+                   "GROUP BY id, g1, v1, version, last_token")]
+    (with-redefs [c/execute! (fn [_ [stmt] & _]
+                               (swap! calls conj stmt)
+                               nil)]
+      (is (= row (mv/create-row-view-with-schedule! ::conn 2 5)))
+      (is (= [row] @calls)))))
+
+(deftest autosched-setup-prefers-create-time-schedule-before-alter-fallback
+  (let [table-reads (atom 0)
+        alter-calls (atom [])
+        result      (with-redefs [mv/drop-artifacts! (fn [_] nil)
+                                  mv/create-base-table! (fn [_] nil)
+                                  mv/split-base-table! (fn [_ _] nil)
+                                  mv/list-table-names (fn [_]
+                                                        (swap! table-reads inc)
+                                                        (if (= 1 @table-reads)
+                                                          #{mv/base-table}
+                                                          #{mv/base-table "$mlog$mv_stateful_base"}))
+                                  mv/create-mlog-with-purge-schedule! (fn [_ _ _] "mlog-scheduled")
+                                  mv/create-row-view-with-schedule! (fn [_ _ _] "row-create-scheduled")
+                                  mv/create-agg-view-with-schedule! (fn [_ _ _] "agg-create-scheduled")
+                                  mv/create-row-view! (fn [_] "row-create-plain")
+                                  mv/create-agg-view! (fn [_] "agg-create-plain")
+                                  mv/schedule-refresh! (fn [& args]
+                                                         (swap! alter-calls conj args)
+                                                         "unexpected-alter")
+                                  mv/schedule-purge! (fn [_ _ _] "purge-scheduled")]
+                      (mv/setup-autosched-schema!
+                       ::conn
+                       [1 2 3 4 5]
+                       {:refresh-start-delay 2
+                        :row-refresh-seconds 5
+                        :agg-refresh-seconds 7
+                        :purge-start-delay 2
+                        :purge-next-seconds 11}))]
+    (is (= "row-create-scheduled" (:row-refresh-stmt result)))
+    (is (= "agg-create-scheduled" (:agg-refresh-stmt result)))
+    (is (= "purge-scheduled" (:purge-schedule-stmt result)))
+    (is (= "$mlog$mv_stateful_base" (:log-table result)))
+    (is (empty? @alter-calls))))
+
 (deftest schedule-ddl-falls-back-to-legacy-expression-variant
   (let [calls  (atom [])
         first  (str "ALTER MATERIALIZED VIEW mv_stateful_row "
@@ -795,6 +846,32 @@
                                nil)]
       (is (= legacy (mv/schedule-refresh! ::conn mv/row-view 2 5)))
       (is (= [first second legacy] @calls)))))
+
+(deftest schedule-ddl-falls-back-to-date-add-expression-variant
+  (let [calls            (atom [])
+        first            (str "ALTER MATERIALIZED VIEW mv_stateful_row "
+                              "REFRESH START WITH NOW(0) + INTERVAL 2 SECOND "
+                              "NEXT NOW(0) + INTERVAL 5 SECOND")
+        second           (str "ALTER MATERIALIZED VIEW mv_stateful_row "
+                              "START WITH NOW(0) + INTERVAL 2 SECOND "
+                              "NEXT NOW(0) + INTERVAL 5 SECOND")
+        legacy           (str "ALTER MATERIALIZED VIEW mv_stateful_row "
+                              "REFRESH START WITH (NOW() + INTERVAL 2 SECOND) "
+                              "NEXT (NOW() + INTERVAL 5 SECOND)")
+        legacy-no-refresh (str "ALTER MATERIALIZED VIEW mv_stateful_row "
+                               "START WITH (NOW() + INTERVAL 2 SECOND) "
+                               "NEXT (NOW() + INTERVAL 5 SECOND)")
+        date-add         (str "ALTER MATERIALIZED VIEW mv_stateful_row "
+                              "REFRESH START WITH DATE_ADD(NOW(0), INTERVAL 2 SECOND) "
+                              "NEXT DATE_ADD(NOW(0), INTERVAL 5 SECOND)")]
+    (with-redefs [c/execute! (fn [_ [stmt] & _]
+                               (swap! calls conj stmt)
+                               (when (#{first second legacy legacy-no-refresh} stmt)
+                                 (throw (java.sql.SQLSyntaxErrorException.
+                                         "synthetic schedule syntax failure")))
+                               nil)]
+      (is (= date-add (mv/schedule-refresh! ::conn mv/row-view 2 5)))
+      (is (= [first second legacy legacy-no-refresh date-add] @calls)))))
 
 (deftest parse-next-literal-supports-datetime-next-expression
   (is (= 5

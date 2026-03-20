@@ -50,13 +50,21 @@
 
 (defn repro-command
   [test]
-  (let [parts (cond-> ["lein run test"
+  (let [ssh-private-key (or (:ssh-private-key test)
+                            (get-in test [:ssh :private-key-path]))
+        parts (cond-> ["lein run test"
                        (cli-opt "--workload" (name (:workload test)))
                        (cli-opt "--nemesis" (nemesis-spec-string test))
                        (cli-opt "--time-limit" (:time-limit test))
                        (cli-opt "--test-count" 1)
                        (cli-opt "--concurrency" (:concurrency test))
                        (cli-opt "--version" (:version test))]
+                (present? (:nodes test))
+                (conj (cli-opt "--nodes" (str/join "," (:nodes test))))
+
+                (present? ssh-private-key)
+                (conj (cli-opt "--ssh-private-key" ssh-private-key))
+
                 (:tarball-url test)
                 (conj (cli-opt "--tarball-url" (:tarball-url test)))
 

@@ -76,8 +76,8 @@ class MViewReportCommonTest(unittest.TestCase):
         self.assertEqual(2, payload["anomaly_count"])
         self.assertEqual(1, payload["warning_count"])
 
-    def test_suite_aggregation_still_uses_valid_flag_for_autosched_gate(self):
-        store = self.root / "autosched-invalid"
+    def test_suite_aggregation_uses_converged_valid_flag_for_autosched_gate(self):
+        store = self.root / "autosched-converged"
         (store / "build").mkdir(parents=True)
         (store / "mv-autosched").mkdir(parents=True)
         (store / "build" / "manifest.json").write_text(
@@ -86,7 +86,7 @@ class MViewReportCommonTest(unittest.TestCase):
         (store / "mv-autosched" / "summary.json").write_text(
             json.dumps(
                 {
-                    "valid?": False,
+                    "valid?": True,
                     "strict-valid?": False,
                     "autosched-converged?": True,
                     "write-resolution-valid?": False,
@@ -97,9 +97,9 @@ class MViewReportCommonTest(unittest.TestCase):
         )
 
         summary = report_common.aggregate_suite("suite", [store])
-        self.assertEqual(1, summary["invalid_run_count"])
-        self.assertEqual(0, summary["valid_run_count"])
-        self.assertFalse(summary["runs"][0]["valid"])
+        self.assertEqual(0, summary["invalid_run_count"])
+        self.assertEqual(1, summary["valid_run_count"])
+        self.assertTrue(summary["runs"][0]["valid"])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
   "Common tasks for Debian boxes."
   (:use clojure.tools.logging)
   (:require [clojure.set :as set]
-            [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c :refer [|]]
             [jepsen.control.util :as cu]
@@ -35,6 +34,24 @@
   "Apt-get update."
   []
   (c/su (c/exec :apt-get :update)))
+
+(def stretch-snapshot-rewrite-script
+  (str "if grep -q '^VERSION_CODENAME=stretch$' /etc/os-release; then\n"
+       "cat >/etc/apt/sources.list <<'EOF'\n"
+       "deb http://snapshot.debian.org/archive/debian/20211220T000000Z stretch main\n"
+       "deb http://snapshot.debian.org/archive/debian-security/20211220T000000Z stretch/updates main\n"
+       "deb http://snapshot.debian.org/archive/debian/20211220T000000Z stretch-updates main\n"
+       "EOF\n"
+       "cat >/etc/apt/apt.conf.d/99jepsen-snapshot <<'EOF'\n"
+       "Acquire::Check-Valid-Until \"false\";\n"
+       "EOF\n"
+       "fi"))
+
+(defn repair-eol-apt-sources!
+  "Debian 9 stretch is EOL; pin it to the preserved snapshot repos before
+  running apt-get update."
+  []
+  (c/su (c/exec :bash :-lc stretch-snapshot-rewrite-script)))
 
 (defn maybe-update!
   "Apt-get update if we haven't done so recently."
@@ -151,6 +168,7 @@
     (info node "setting up debian")
 
     (setup-hostfile!)
+    (repair-eol-apt-sources!)
 
     (maybe-update!)
 
@@ -178,7 +196,7 @@
               ; Wrong package name; let's use the old one for jessie
               (install [:libzip2]))))
 
-    (meh (net/heal! (:net test) test)))
+    (net/prepare! test))
 
   (teardown! [_ test node]))
 

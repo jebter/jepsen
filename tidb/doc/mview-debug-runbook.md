@@ -62,6 +62,24 @@ lein run test --workload mv-lifecycle --nemesis none --time-limit 300 --test-cou
 WORKLOAD_FILTER=mv-lifecycle scripts/mview_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
 ```
 
+## Bridge-backed direct runs
+
+When a direct Jepsen debug run uses a fresh testbed created by `scripts/mview_testbed_bridge.sh`, source the generated bridge env first. The bridge now exports `JEPSEN_NODES` and `JEPSEN_SSH_PRIVATE_KEY`, and `jepsen.cli` will use them automatically when raw CLI flags are omitted.
+
+Rules:
+
+- sourcing `bridge.env.sh` is enough for raw `lein run test` as long as you do not override nodes or SSH key with conflicting flags
+- explicit `--nodes` and `--ssh-private-key` still override the bridge env and remain useful for debugging command construction
+- the `scripts/mview_run_and_report.sh` and suite wrappers also pick up the bridge node and SSH env automatically
+
+Example:
+
+```bash
+source /tmp/mview-testbed-XXXXXX/bridge.env.sh
+export JEPSEN_BEST_EFFORT_NET=1
+lein run test --workload mv-autosched --nemesis partition --time-limit 60 --test-count 1 --concurrency 10 --tarball-url <tarball-url> --binary-urls <binary-urls>
+```
+
 ## Always pin the build identity
 
 Before debugging semantics, make sure the run records:
@@ -130,6 +148,7 @@ Rules:
 
 - non-network faults may still be useful with `JEPSEN_BEST_EFFORT_NET=true`
 - `partition` is not trustworthy when the environment lacks `NET_ADMIN`
+- current direct runs fail fast during setup with a `Real network fault injection is required ... lacks permissions for iptables-based partition faults` error when this capability is missing
 - do not treat a `partition` failure from that environment as a product conclusion until the environment is verified
 
 If the environment cannot inject real network faults:
