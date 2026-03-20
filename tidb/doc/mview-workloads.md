@@ -79,6 +79,7 @@ Current checker contract:
 - quiet phase must produce two consecutive equal snapshots before declaring stable
 - if the MLog backing table is discoverable, the checker also reports whether purge visibly progressed
 - if the MLog backing table is not discoverable in SQL metadata, purge evidence is reported as `unknown` rather than failing the whole test only because telemetry is unavailable
+- unresolved write ambiguity is still surfaced via `strict-valid?` and `first-unresolved-write`, but it does not fail an otherwise converged autosched run by itself
 
 ### `mv-autosched-time`
 

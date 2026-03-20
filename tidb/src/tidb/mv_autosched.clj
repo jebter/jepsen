@@ -517,7 +517,7 @@
                                       purge-progress-ok?)
             strict-valid?        (and autosched-converged?
                                       write-resolution-valid?)]
-        (let [summary {:valid?                    strict-valid?
+        (let [summary {:valid?                    autosched-converged?
                        :strict-valid?             strict-valid?
                        :autosched-converged?      autosched-converged?
                        :write-resolution-valid?   write-resolution-valid?
