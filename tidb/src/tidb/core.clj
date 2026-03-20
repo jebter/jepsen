@@ -36,7 +36,7 @@
   os/OS
   (setup! [_ test node]
           (info node "setting up prepared image")
-          (util/meh (net/heal! (:net test) test)))
+          (net/prepare! test))
   (teardown! [_ test node]))
 
 (def oses

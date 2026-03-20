@@ -8,7 +8,8 @@
             [clojure.tools.logging :refer [info warn]]
             [jepsen.control :refer :all]
             [jepsen.control.net :as control.net]
-            [jepsen.net.proto :as p]))
+            [jepsen.net.proto :as p]
+            [jepsen.util :refer [meh]]))
 
 ; TODO: move this into jepsen.net.proto
 (defprotocol Net
@@ -44,6 +45,16 @@
 
 (def tc "/sbin/tc")
 
+(def partition-nemesis-keys
+  #{:partition
+    :partition-one
+    :partition-pd-leader
+    :partition-half
+    :partition-ring})
+
+(def netem-nemesis-keys
+  #{:netem})
+
 (defn best-effort-net?
   "Whether network rule operations should degrade instead of failing hard when
   the environment lacks NET_ADMIN-like privileges."
@@ -64,6 +75,71 @@
   [test]
   (and (best-effort-net?)
        (not (:requires-real-network? test))))
+
+(defn required-network-capabilities
+  "Returns the network capabilities that must be available for this test."
+  [test]
+  (let [nemesis-spec (:nemesis-spec test)]
+    (cond-> []
+      (some #(get nemesis-spec %) partition-nemesis-keys) (conj :iptables)
+      (some #(get nemesis-spec %) netem-nemesis-keys) (conj :tc))))
+
+(defn capability-label
+  [capability]
+  (case capability
+    :iptables "iptables-based partition faults"
+    :tc       "tc/netem-based network shaping"
+    (name capability)))
+
+(defn probe-network-capability!
+  [test capability]
+  (case capability
+    :iptables (heal! (:net test) test)
+    :tc       (fast! (:net test) test)
+    (throw (IllegalArgumentException.
+             (str "Unknown network capability probe: " capability)))))
+
+(defn real-network-unavailable-error
+  [test capability e]
+  (let [requested-nemeses (-> (:nemesis-spec test)
+                              (dissoc :interval :schedule :long-recovery :failpoints)
+                              keys
+                              sort
+                              vec)]
+    (ex-info
+      (str "Real network fault injection is required for "
+           (pr-str requested-nemeses)
+           ", but the testbed lacks permissions for "
+           (capability-label capability)
+           ". Probe failed with: "
+           (.getMessage e))
+      {:type                    ::real-network-unavailable
+       :capability              capability
+       :capability-label        (capability-label capability)
+       :nemesis-spec            (:nemesis-spec test)
+       :requires-real-network?  (:requires-real-network? test)
+       :best-effort-net?        (best-effort-net?)
+       :hint                    "Use a NET_ADMIN-capable testbed for partition/netem faults, or skip those nemeses in this environment."}
+      e)))
+
+(defn ensure-required-network!
+  [test]
+  (doseq [capability (or (seq (required-network-capabilities test))
+                         [:iptables])]
+    (try
+      (probe-network-capability! test capability)
+      (catch RuntimeException e
+        (if (permission-denied-net-op? e)
+          (throw (real-network-unavailable-error test capability e))
+          (throw e))))))
+
+(defn prepare!
+  "Resets network state during setup and fails fast when required network
+  privileges are missing."
+  [test]
+  (if (:requires-real-network? test)
+    (ensure-required-network! test)
+    (meh (heal! (:net test) test))))
 
 (defmacro with-best-effort-net
   [test & body]

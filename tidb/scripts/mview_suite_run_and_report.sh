@@ -16,7 +16,7 @@ SUITE_OUTPUT_DIR="${SUITE_OUTPUT_DIR:-}"
 if [[ -z "$SUITE" || -z "$TARBALL_URL" ]]; then
   echo "usage: $0 <suite> <tarball-url> [binary-urls]" >&2
   echo "supported suites: branch-validation full-single-fault autosched-longrun" >&2
-  echo "optional env: REPORT_FORMAT SUITE_OUTPUT_DIR WORKLOAD_FILTER plus the same BUILD_*/FEATURE_FLAGS/TXN_MODE env vars accepted by the underlying suite script" >&2
+  echo "optional env: REPORT_FORMAT SUITE_OUTPUT_DIR WORKLOAD_FILTER plus the same BUILD_*/FEATURE_FLAGS/NODES/SSH_PRIVATE_KEY/TXN_MODE env vars accepted by the underlying suite script" >&2
   exit 1
 fi
 

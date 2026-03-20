@@ -2,7 +2,6 @@
   "Common tasks for Ubuntu boxes. Tested against Ubuntu 18.04."
   (:use clojure.tools.logging)
   (:require [clojure.set :as set]
-            [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c :refer [|]]
             [jepsen.control.util :as cu]
@@ -40,7 +39,7 @@
                 :sudo
                 :logrotate]))
 
-    (meh (net/heal! (:net test) test)))
+    (net/prepare! test))
 
   (teardown! [_ test node]))
 

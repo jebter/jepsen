@@ -2,7 +2,6 @@
   "Common tasks for CentOS boxes."
   (:use clojure.tools.logging)
   (:require [clojure.set :as set]
-            [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c]
             [jepsen.control.util :as cu]
@@ -155,7 +154,7 @@
 
     (if (not= true (installed-start-stop-daemon?)) (install-start-stop-daemon!) (info "start-stop-daemon already installed"))
 
-    (meh (net/heal! (:net test) test)))
+    (net/prepare! test))
 
   (teardown! [_ test node]))
 

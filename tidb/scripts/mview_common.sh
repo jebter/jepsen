@@ -14,7 +14,8 @@ mview_init_base_env() {
   FEATURE_FLAGS="${FEATURE_FLAGS:-}"
   BUILD_NOTES="${BUILD_NOTES:-$build_notes_default}"
   CONCURRENCY="${CONCURRENCY:-2n}"
-  SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}"
+  NODES="${NODES:-${JEPSEN_NODES:-}}"
+  SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-${JEPSEN_SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}}"
   TXN_MODE="${TXN_MODE:-optimistic}"
 }
 
@@ -28,7 +29,7 @@ mview_require_tarball() {
   local extra_env_help="$2"
   if [[ -z "${TARBALL_URL:-}" ]]; then
     echo "usage: $usage" >&2
-    echo "optional env: BUILD_BRANCH BUILD_COMMIT_SHA BUILD_TIME FEATURE_FLAGS BUILD_NOTES CONCURRENCY SSH_PRIVATE_KEY TXN_MODE${extra_env_help}" >&2
+    echo "optional env: BUILD_BRANCH BUILD_COMMIT_SHA BUILD_TIME FEATURE_FLAGS BUILD_NOTES CONCURRENCY NODES SSH_PRIVATE_KEY TXN_MODE${extra_env_help}" >&2
     exit 1
   fi
 }
@@ -182,6 +183,10 @@ mview_run_test() {
     --tarball-url "$TARBALL_URL"
     --ssh-private-key "$SSH_PRIVATE_KEY"
   )
+
+  if [[ -n "${NODES:-}" ]]; then
+    cmd+=(--nodes "$NODES")
+  fi
 
   if [[ ${#MVIEW_BUILD_ARGS[@]} -gt 0 ]]; then
     cmd+=("${MVIEW_BUILD_ARGS[@]}")

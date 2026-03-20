@@ -18,7 +18,11 @@
 (defn- schedule-timestamp-exprs
   [seconds]
   [(str "NOW(0) + INTERVAL " seconds " SECOND")
-   (str "(NOW() + INTERVAL " seconds " SECOND)")])
+   (str "(NOW() + INTERVAL " seconds " SECOND)")
+   (str "DATE_ADD(NOW(0), INTERVAL " seconds " SECOND)")
+   (str "(DATE_ADD(NOW(0), INTERVAL " seconds " SECOND))")
+   (str "DATE_ADD(NOW(), INTERVAL " seconds " SECOND)")
+   (str "(DATE_ADD(NOW(), INTERVAL " seconds " SECOND))")])
 
 (defn- schedule-clause-pairs
   [start-delay next-seconds]
@@ -131,6 +135,23 @@
                     "WHERE deleted = 0 "
                     "GROUP BY id, g1, v1, version, last_token")]))
 
+(defn create-row-view-with-schedule!
+  [conn start-delay next-seconds]
+  (try-statements!
+   conn
+   (str "Create scheduled view failed for " row-view)
+   (mapv (fn [[start-expr next-expr]]
+           (str "CREATE MATERIALIZED VIEW " row-view " "
+                "(id, g1, v1, version, last_token, live_cnt) "
+                "COMMENT = 'jepsen:mv-stateful(row)' "
+                "REFRESH FAST START WITH " start-expr " "
+                "NEXT " next-expr " AS "
+                "SELECT id, g1, v1, version, last_token, COUNT(*) AS live_cnt "
+                "FROM " base-table " "
+                "WHERE deleted = 0 "
+                "GROUP BY id, g1, v1, version, last_token"))
+         (schedule-clause-pairs start-delay next-seconds))))
+
 (defn create-agg-view!
   [conn]
   (c/execute! conn
@@ -146,6 +167,27 @@
                     "FROM " base-table " "
                     "WHERE deleted = 0 "
                     "GROUP BY g1")]))
+
+(defn create-agg-view-with-schedule!
+  [conn start-delay next-seconds]
+  (try-statements!
+   conn
+   (str "Create scheduled view failed for " agg-view)
+   (mapv (fn [[start-expr next-expr]]
+           (str "CREATE MATERIALIZED VIEW " agg-view " "
+                "(g1, cnt, sum_v1, min_v1, max_v1) "
+                "COMMENT = 'jepsen:mv-stateful(agg)' "
+                "REFRESH FAST START WITH " start-expr " "
+                "NEXT " next-expr " AS "
+                "SELECT g1, "
+                "COUNT(*) AS cnt, "
+                "SUM(v1)  AS sum_v1, "
+                "MIN(v1)  AS min_v1, "
+                "MAX(v1)  AS max_v1 "
+                "FROM " base-table " "
+                "WHERE deleted = 0 "
+                "GROUP BY g1"))
+         (schedule-clause-pairs start-delay next-seconds))))
 
 (defn- refresh-lock-conflict?
   [^java.sql.SQLException e]
@@ -807,10 +849,22 @@
         tables-after  (list-table-names conn)
         log-table     (first (sort (remove #{base-table row-view agg-view}
                                            (clojure.set/difference tables-after tables-before))))
-        _             (create-row-view! conn)
-        _             (create-agg-view! conn)
-        row-stmt      (schedule-refresh! conn row-view refresh-start-delay row-refresh-seconds)
-        agg-stmt      (schedule-refresh! conn agg-view refresh-start-delay agg-refresh-seconds)
+        row-stmt      (or (try
+                            (create-row-view-with-schedule! conn refresh-start-delay row-refresh-seconds)
+                            (catch java.sql.SQLException _
+                              (execute-safely! conn (str "DROP MATERIALIZED VIEW " row-view))
+                              nil))
+                          (do
+                            (create-row-view! conn)
+                            (schedule-refresh! conn row-view refresh-start-delay row-refresh-seconds)))
+        agg-stmt      (or (try
+                            (create-agg-view-with-schedule! conn refresh-start-delay agg-refresh-seconds)
+                            (catch java.sql.SQLException _
+                              (execute-safely! conn (str "DROP MATERIALIZED VIEW " agg-view))
+                              nil))
+                          (do
+                            (create-agg-view! conn)
+                            (schedule-refresh! conn agg-view refresh-start-delay agg-refresh-seconds)))
         purge-stmt    (or (try (schedule-purge! conn purge-start-delay purge-next-seconds)
                                (catch java.sql.SQLException _ nil))
                           mlog-stmt)]

@@ -19,7 +19,7 @@ mview_init_time_limit 900
 if [[ -z "$WORKLOAD" || -z "$TARBALL_URL" ]]; then
   echo "usage: $0 <workload> <tarball-url> [binary-urls]" >&2
   echo "supported workloads: mv-stateful mv-lifecycle mv-autosched mv-autosched-time" >&2
-  echo "optional env: NEMESIS BUILD_BRANCH BUILD_COMMIT_SHA BUILD_TIME FEATURE_FLAGS BUILD_NOTES CONCURRENCY SSH_PRIVATE_KEY TXN_MODE TIME_LIMIT REPORT_FORMAT REPORT_JSON_OUT REPORT_TEXT_OUT" >&2
+  echo "optional env: NEMESIS BUILD_BRANCH BUILD_COMMIT_SHA BUILD_TIME FEATURE_FLAGS BUILD_NOTES CONCURRENCY NODES SSH_PRIVATE_KEY TXN_MODE TIME_LIMIT REPORT_FORMAT REPORT_JSON_OUT REPORT_TEXT_OUT" >&2
   exit 1
 fi
 

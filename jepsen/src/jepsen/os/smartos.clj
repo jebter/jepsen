@@ -2,7 +2,6 @@
   "Common tasks for SmartOS boxes."
   (:use clojure.tools.logging)
   (:require [clojure.set :as set]
-            [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c]
             [jepsen.control.util :as cu]
@@ -127,6 +126,6 @@
       (c/su
        (c/exec :svcadm :enable :-r :ipfilter))
 
-      (meh (net/heal! (:net test) test)))
+      (net/prepare! test))
 
     (teardown! [_ test node])))

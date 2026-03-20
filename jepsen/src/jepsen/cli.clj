@@ -16,6 +16,17 @@
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
+(defn getenv
+  [k]
+  (System/getenv k))
+
+(defn- env-value
+  [& ks]
+  (some->> ks
+           (map getenv)
+           (remove str/blank?)
+           first))
+
 (defn one-of
   "Takes a collection and returns a string like \"Must be one of ...\" and a
   list of names. For maps, uses keys."
@@ -215,11 +226,32 @@ Options:\n")
                        :strict-host-key-checking
                        :private-key-path)))))
 
+(defn apply-env-defaults
+  "Applies bridge-friendly environment defaults when CLI flags are omitted."
+  [parsed]
+  (let [options            (:options parsed)
+        env-nodes          (some-> (env-value "JEPSEN_NODES" "NODES")
+                                   (str/split #",\s*"))
+        env-ssh-private-key (env-value "JEPSEN_SSH_PRIVATE_KEY" "SSH_PRIVATE_KEY")
+        default-node?      (identical? (:node options) default-nodes)
+        node-override?     (or (:nodes options)
+                               (:nodes-file options)
+                               (not default-node?))
+        ssh-override?      (:ssh-private-key options)]
+    (assoc parsed :options
+           (cond-> options
+             (and (seq env-nodes) (not node-override?))
+             (assoc :nodes env-nodes)
+
+             (and env-ssh-private-key (not ssh-override?))
+             (assoc :ssh-private-key env-ssh-private-key)))))
+
 (defn test-opt-fn
   "An opt fn for running simple tests. Remaps ssh keys, remaps :node to :nodes,
   reads :nodes-file into :nodes, and parses :concurrency."
   [parsed]
   (-> parsed
+      apply-env-defaults
       rename-ssh-options
       parse-nodes
       parse-concurrency))
