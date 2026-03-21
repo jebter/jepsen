@@ -225,9 +225,40 @@ start_sql_tunnels() {
     fqdn="$(node_fqdn "$namespace" "$index")"
     port="$(find_free_local_port)"
     log_file="$(sql_tunnel_log_file "$workdir" "$index")"
+    : >"$log_file"
 
-    nohup env KUBECONFIG="$kubeconfig" kubectl port-forward -n "$namespace" "pod/node-$index" \
-      "$port:4000" >"$log_file" 2>&1 </dev/null &
+    nohup bash -c '
+      set -euo pipefail
+      kubeconfig="$1"
+      namespace="$2"
+      index="$3"
+      port="$4"
+      log_file="$5"
+      child_pid=""
+
+      cleanup() {
+        if [[ -n "${child_pid:-}" ]]; then
+          kill "$child_pid" >/dev/null 2>&1 || true
+          wait "$child_pid" >/dev/null 2>&1 || true
+        fi
+        exit 0
+      }
+
+      trap cleanup TERM INT EXIT
+
+      while true; do
+        printf "[restart %s] starting port-forward node-%s %s\n" \
+          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$index" "$port" >>"$log_file"
+        env KUBECONFIG="$kubeconfig" kubectl port-forward -n "$namespace" "pod/node-$index" \
+          "$port:4000" >>"$log_file" 2>&1 &
+        child_pid=$!
+        wait "$child_pid" >/dev/null 2>&1 || true
+        child_pid=""
+        printf "[restart %s] port-forward node-%s exited\n" \
+          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$index" >>"$log_file"
+        sleep 0.2
+      done
+    ' bash "$kubeconfig" "$namespace" "$index" "$port" "$log_file" >/dev/null 2>&1 </dev/null &
     pid=$!
     printf '%s\n' "$pid" >>"$pid_file"
 

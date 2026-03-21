@@ -298,9 +298,21 @@
           dest (.. FileSystems
                    getDefault
                    (getPath base-dir (into-array dest)))]
-      (Files/deleteIfExists dest)
-      (Files/createSymbolicLink dest (.relativize (.getParent dest) src)
-                                (make-array FileAttribute 0)))))
+      (loop [attempt 0]
+        (Files/deleteIfExists dest)
+        (let [result (try
+                       (Files/createSymbolicLink dest (.relativize (.getParent dest) src)
+                                                 (make-array FileAttribute 0))
+                       :created
+                       (catch java.nio.file.FileAlreadyExistsException e
+                         e))]
+          (if (= :created result)
+            nil
+            (if (< attempt 5)
+              (do
+                (Thread/sleep 10)
+                (recur (inc attempt)))
+              (throw result))))))))
 
 (defn update-current-symlink!
   "Creates a `current` symlink to the currently running test, if a store

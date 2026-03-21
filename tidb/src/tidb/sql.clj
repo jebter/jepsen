@@ -60,47 +60,77 @@
 (defn init-conn!
   "Sets initial variables on a connection, based on test options.
   Returns conn."
-  [conn test]
-  (doseq [stmt (init-sql test)]
-    (info (str "init> " stmt))
-    (j/execute! conn [stmt]))
-  conn)
+  ([conn test]
+   (init-conn! conn test nil))
+  ([conn test stage]
+   (doseq [stmt (init-sql test)]
+     (when stage
+       (reset! stage {:phase :init-conn
+                      :stmt  stmt}))
+     (info (str "init> " stmt))
+     (j/execute! conn [stmt])
+     (info (str "init< " stmt)))
+   (when stage
+     (reset! stage :ready))
+   conn))
 
 (defn open
   "Opens a connection to the given node."
   ([node test]
    (open node test open-timeout))
   ([node test open-timeout]
-   (timeout open-timeout
-            (throw+ {:type :connect-timed-out
-                     :node node})
-            (util/retry 1
-                        (try
-                          (let [spec (assoc (conn-spec node)
-                                            ::node node
-                                            ; jdbc is gonna convert everything
-                                            ; in the spec to a string at some
-                                            ; point, so we scrupulously do NOT
-                                            ; want to pass it the full test, or
-                                            ; it'll blow out RAM.
-                                            ::test (select-keys
-                                                     test
-                                                     [:auto-retry
-                                                      :auto-retry-limit
-                                                      :version
-                                                      :txn-mode
-                                                      :follower-read
-                                                      :init-sql]))
-                                conn   (j/get-connection spec)
-                                spec'  (j/add-connection spec conn)]
-                            (assert spec')
-                            (init-conn! spec' test))
-                          (catch java.sql.SQLNonTransientConnectionException e
-                            ; Conn refused
-                            (throw e))
-                          (catch Throwable t
-                            (info t "Unexpected connection error, retrying")
-                            (throw t)))))))
+   (let [stage (atom :build-spec)]
+     (timeout open-timeout
+              (throw+ {:type  :connect-timed-out
+                       :node  node
+                       :stage @stage})
+              (util/retry 1
+                          (try
+                            (let [spec (assoc (conn-spec node)
+                                              ::node node
+                                              ; jdbc is gonna convert everything
+                                              ; in the spec to a string at some
+                                              ; point, so we scrupulously do NOT
+                                              ; want to pass it the full test, or
+                                              ; it'll blow out RAM.
+                                              ::test (select-keys
+                                                       test
+                                                       [:auto-retry
+                                                        :auto-retry-limit
+                                                        :version
+                                                        :txn-mode
+                                                        :follower-read
+                                                        :init-sql]))
+                                  t0   (System/nanoTime)]
+                              (reset! stage :get-connection)
+                              (info {:open/node              node
+                                     :open/stage             @stage
+                                     :open/jdbc-url          (:subname spec)
+                                     :open/open-timeout-ms   open-timeout
+                                     :open/connect-timeout-ms connect-timeout
+                                     :open/socket-timeout-ms socket-timeout})
+                              (let [conn  (j/get-connection spec)
+                                    _     (info {:open/node           node
+                                                 :open/stage          :got-connection
+                                                 :open/elapsed-ms     (util/nanos->ms
+                                                                        (- (System/nanoTime) t0))})
+                                    _     (reset! stage :wrap-connection)
+                                    spec' (j/add-connection spec conn)]
+                                (assert spec')
+                                (reset! stage :init-conn)
+                                (let [conn' (init-conn! spec' test stage)]
+                                  (info {:open/node       node
+                                         :open/stage      :ready
+                                         :open/elapsed-ms (util/nanos->ms
+                                                            (- (System/nanoTime) t0))})
+                                  conn')))
+                            (catch java.sql.SQLNonTransientConnectionException e
+                              ; Conn refused
+                              (throw e))
+                            (catch Throwable t
+                              (info t "Unexpected connection error, retrying" {:node node
+                                                                                :stage @stage})
+                              (throw t))))))))
 
 (defn close!
   "Given a JDBC connection, closes it and returns the underlying spec."
