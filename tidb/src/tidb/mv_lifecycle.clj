@@ -103,6 +103,12 @@
 (def refresh-op-fns
   #{:refresh-row :refresh-agg})
 
+(def lifecycle-transition-settle-timeout-ms
+  15000)
+
+(def lifecycle-transition-settle-poll-ms
+  500)
+
 (defn artifact-state-diff
   [actual expected]
   (->> expected
@@ -117,6 +123,34 @@
   (cond-> {:expected-state expected}
     actual (assoc :artifact-state actual)
     (seq diff) (assoc :diff diff)))
+
+(defn- await-transition-state!
+  [read-state! expected]
+  (let [deadline (+ (System/nanoTime)
+                    (* lifecycle-transition-settle-timeout-ms 1000000))]
+    (loop [last-actual nil
+           last-diff   nil]
+      (let [actual' (try
+                      (read-state!)
+                      (catch Throwable _
+                        nil))
+            diff'   (when actual'
+                      (artifact-state-diff actual' expected))
+            actual  (or actual' last-actual)
+            diff    (or diff' last-diff)]
+        (cond
+          (and actual' (empty? diff'))
+          {:actual actual'
+           :diff   diff'}
+
+          (< (System/nanoTime) deadline)
+          (do
+            (Thread/sleep lifecycle-transition-settle-poll-ms)
+            (recur actual diff))
+
+          :else
+          {:actual actual
+           :diff   diff})))))
 
 (defn- next-write-op
   [seqs process]
@@ -158,12 +192,8 @@
     (try
       (lifecycle-transition-on-conn! conn op (fn [_] (action)))
       (catch Throwable t
-        (let [actual (try
-                       (mv/artifact-state conn)
-                       (catch Throwable _
-                         nil))
-              diff   (when actual
-                       (artifact-state-diff actual expected))
+        (let [{:keys [actual diff]}
+              (await-transition-state! #(mv/artifact-state conn) expected)
               value  (transition-value expected actual diff)]
           (if (and actual
                    (empty? diff))
@@ -184,13 +214,11 @@
         (fn [conn]
           (lifecycle-transition-on-conn! conn op action)))
       (catch Throwable t
-        (let [actual (try
-                       (stateful/with-reconnect! conn-holder node test stateful/setup-retryable-error?
-                         mv/artifact-state)
-                       (catch Throwable _
-                         nil))
-              diff   (when actual
-                       (artifact-state-diff actual expected))
+        (let [{:keys [actual diff]}
+              (await-transition-state!
+               #(stateful/with-reconnect! conn-holder node test stateful/setup-retryable-error?
+                  mv/artifact-state)
+               expected)
               value  (transition-value expected actual diff)]
           (if (and actual
                    (empty? diff))
