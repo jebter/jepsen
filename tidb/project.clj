@@ -3,7 +3,7 @@
   :url "https://pingcap.com/index"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :main tidb.core
+  :main ^:skip-aot tidb.core
   :dependencies [[org.clojure/clojure "1.10.0"]
                  [clj-http "3.10.0"]
                  [cheshire "5.8.1"]

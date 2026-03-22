@@ -462,6 +462,42 @@
                                                                   "n2" -4.1}}]
            {})))
 
+(deftest plot-checkers-skip-without-gnuplot-test
+  (with-redefs [cp/gnuplot-available? (constantly false)]
+    (let [history [{:process 0, :type :invoke, :f :read, :time 0}
+                   {:process 0, :type :ok, :f :read, :time 1000}]
+          skipped {:valid? true
+                   :skipped? true
+                   :reason cp/gnuplot-skip-reason}]
+      (is (= skipped
+             (check (latency-graph)
+                    {:name "latency graph"
+                     :start-time 0}
+                    history
+                    {})))
+      (is (= skipped
+             (check (rate-graph)
+                    {:name "rate graph"
+                     :start-time 0}
+                    history
+                    {})))
+      (is (= {:latency-graph skipped
+              :rate-graph skipped
+              :valid? true}
+             (check (perf)
+                    {:name "perf graph"
+                     :start-time 0}
+                    history
+                    {})))
+      (is (= skipped
+             (check (clock-plot)
+                    {:name "clock plot test"
+                     :start-time 0}
+                    [{:process :nemesis
+                      :time 1000000000
+                      :clock-offsets {"n1" 0.1}}]
+                    {}))))))
+
 (defn history
   "Takes a sequence of operations and adds times and indexes."
   [h]

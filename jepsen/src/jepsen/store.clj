@@ -278,16 +278,29 @@
         (map (fn [f] [f (delay (load test-name f))]))
         (into {}))))
 
+(defn- latest-entry
+  [test-name]
+  (if test-name
+    (when-let [runs (seq (tests test-name))]
+      (->> runs
+           (sort-by key)
+           util/fast-last))
+    (when-let [runs (seq (mapcat (fn [[name test-runs]]
+                                   (for [[run test] test-runs]
+                                     [[run name] test]))
+                                 (tests)))]
+      (->> runs
+           (sort-by first)
+           util/fast-last))))
+
 (defn latest
-  "Loads the latest test"
-  []
-  (when-let [t (->> (tests)
-                    vals
-                    (apply concat)
-                    sort
-                    util/fast-last
-                    val)]
-    @t))
+  "Loads the latest test. If test-name is provided, restricts the search to
+  that test name."
+  ([]
+   (latest nil))
+  ([test-name]
+   (when-let [[_ t] (latest-entry test-name)]
+     @t)))
 
 (defn update-symlink!
   "Takes a test and a symlink path. Creates a symlink from that path to the

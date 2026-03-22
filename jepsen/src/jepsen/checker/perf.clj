@@ -1,6 +1,7 @@
 (ns jepsen.checker.perf
   "Supporting functions for performance analysis."
   (:require [clojure.stacktrace :as trace]
+            [clojure.java.shell :as sh]
             [fipp.edn :refer [pprint]]
             [clojure.core.reducers :as r]
             [clojure.set :as set]
@@ -13,6 +14,26 @@
             [knossos.core :as knossos]
             [knossos.op :as op]
             [knossos.history :as history]))
+
+(def ^:private gnuplot-available*
+  (delay
+    (try
+      (zero? (:exit (sh/sh "sh" "-lc" "command -v gnuplot >/dev/null 2>&1")))
+      (catch Throwable _
+        false))))
+
+(def gnuplot-skip-reason
+  "gnuplot is not installed or reachable; skipping plot generation")
+
+(defn gnuplot-available?
+  []
+  @gnuplot-available*)
+
+(defn skip-result
+  []
+  {:valid? true
+   :skipped? true
+   :reason gnuplot-skip-reason})
 
 (def default-nemesis-color "#cccccc")
 (def nemesis-alpha 0.6)

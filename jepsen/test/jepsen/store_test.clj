@@ -69,3 +69,27 @@
                @t')))
       (testing "results.edn"
         (is (= (:results t) (load-results "store-test" k)))))))
+
+(deftest latest-test
+  (let [alpha-latest {:name "alpha" :start-time "20260322T010000.000+0800"}
+        beta-earlier {:name "beta"  :start-time "20260322T000000.000+0800"}
+        beta-latest  {:name "beta"  :start-time "20260322T020000.000+0800"}]
+    (with-redefs [jepsen.store/tests
+                  (fn
+                    ([] {"alpha" {"20260322T000000.000+0800" (delay {:name "alpha"
+                                                                     :start-time "20260322T000000.000+0800"})
+                                  "20260322T010000.000+0800" (delay alpha-latest)}
+                         "beta"  {"20260322T000000.000+0800" (delay beta-earlier)
+                                  "20260322T020000.000+0800" (delay beta-latest)}})
+                    ([test-name]
+                     (case (name test-name)
+                       "alpha" {"20260322T000000.000+0800" (delay {:name "alpha"
+                                                                   :start-time "20260322T000000.000+0800"})
+                                "20260322T010000.000+0800" (delay alpha-latest)}
+                       "beta"  {"20260322T000000.000+0800" (delay beta-earlier)
+                                "20260322T020000.000+0800" (delay beta-latest)}
+                       {})))]
+      (is (= beta-latest (latest)))
+      (is (= alpha-latest (latest "alpha")))
+      (is (= beta-latest (latest :beta)))
+      (is (nil? (latest "missing"))))))
