@@ -739,6 +739,81 @@
     (is (true? (:post-fault-refresh? summary)))
     (is (= :decreased (:post-fault-purge summary)))))
 
+(deftest autosched-checker-records-runtime-and-history-progress
+  (let [first-snapshot  (update (snapshot-op 0 "n1" true true 10 20 5)
+                                :value
+                                assoc
+                                :runtime-metadata
+                                {:rows [{:component :row-refresh
+                                         :next-time-ms 1000
+                                         :last-success-read-tso 10}
+                                        {:component :agg-refresh
+                                         :next-time-ms 2000
+                                         :last-success-read-tso 20}
+                                        {:component :log-purge
+                                         :next-time-ms 3000
+                                         :last-purged-tso 30}]
+                                 :recent-history [{:component :row-refresh
+                                                   :job-id 1
+                                                   :status "RUNNING"
+                                                   :end-time-ms 1010
+                                                   :read-tso 10
+                                                   :row-count 1}
+                                                  {:component :agg-refresh
+                                                   :job-id 2
+                                                   :status "RUNNING"
+                                                   :end-time-ms 2020
+                                                   :read-tso 20
+                                                   :row-count 2}
+                                                  {:component :log-purge
+                                                   :job-id 3
+                                                   :status "RUNNING"
+                                                   :end-time-ms 3030
+                                                   :row-count 3}]})
+        second-snapshot (update (snapshot-op 1 "n1" true true 10 20 0)
+                                :value
+                                assoc
+                                :runtime-metadata
+                                {:rows [{:component :row-refresh
+                                         :next-time-ms 1100
+                                         :last-success-read-tso 11}
+                                        {:component :agg-refresh
+                                         :next-time-ms 2100
+                                         :last-success-read-tso 21}
+                                        {:component :log-purge
+                                         :next-time-ms 3100
+                                         :last-purged-tso 31}]
+                                 :recent-history [{:component :row-refresh
+                                                   :job-id 4
+                                                   :status "SUCCESS"
+                                                   :end-time-ms 1110
+                                                   :read-tso 11
+                                                   :row-count 4}
+                                                  {:component :agg-refresh
+                                                   :job-id 5
+                                                   :status "SUCCESS"
+                                                   :end-time-ms 2120
+                                                   :read-tso 21
+                                                   :row-count 5}
+                                                  {:component :log-purge
+                                                   :job-id 6
+                                                   :status "SUCCESS"
+                                                   :end-time-ms 3130
+                                                   :row-count 6}]})
+        summary         (checker/check (autosched/checker*)
+                                       {}
+                                       [first-snapshot second-snapshot]
+                                       nil)]
+    (is (true? (:valid? summary)))
+    (is (true? (:row-refresh-converged? summary)))
+    (is (true? (:agg-refresh-converged? summary)))
+    (is (true? (:row-refresh-runtime-advanced? summary)))
+    (is (true? (:agg-refresh-runtime-advanced? summary)))
+    (is (true? (:purge-runtime-advanced? summary)))
+    (is (true? (:row-refresh-history-advanced? summary)))
+    (is (true? (:agg-refresh-history-advanced? summary)))
+    (is (true? (:purge-history-advanced? summary)))))
+
 (deftest autosched-checker-still-fails-when-quiet-phase-does-not-converge
   (let [summary (checker/check (autosched/checker*)
                                {}
@@ -995,6 +1070,39 @@
                               :next_time_ms 1700000003000
                               :last_purged_tso 54321}]
 
+                            (re-find #"JOIN mysql\.tidb_mview_refresh_hist" sql)
+                            [{:object_name mv/row-view
+                              :object_id 101
+                              :job_id 9001
+                              :start_time_ms 1700000000000
+                              :end_time_ms 1700000001000
+                              :status "SUCCESS"
+                              :row_count 8
+                              :read_tso 23456
+                              :failed_reason nil}
+                             {:object_name mv/agg-view
+                              :object_id 102
+                              :job_id 9002
+                              :start_time_ms 1700000002000
+                              :end_time_ms 1700000002500
+                              :status "RUNNING"
+                              :row_count 3
+                              :read_tso 23457
+                              :failed_reason "retrying"}]
+
+                            (re-find #"JOIN mysql\.tidb_mlog_purge_hist" sql)
+                            [{:object_name "$mlog$mv_stateful_base"
+                              :object_id 103
+                              :job_id 9003
+                              :start_time_ms 1700000003000
+                              :end_time_ms 1700000003200
+                              :status "SUCCESS"
+                              :row_count 5
+                              :failed_reason nil}]
+
+                            (re-find #"FROM mysql\.tidb_timers" sql)
+                            []
+
                             :else
                             (throw (ex-info "unexpected query" {:sql sql}))))]
     (let [summary (mv/read-runtime-metadata ::conn {:log-table "$mlog$mv_stateful_base"})]
@@ -1002,13 +1110,21 @@
       (is (= :system-tables (:source summary)))
       (is (= [mv/mview-refresh-info-table mv/mlog-purge-info-table]
              (:tables summary)))
+      (is (= [mv/mview-refresh-hist-table mv/mlog-purge-hist-table]
+             (:history-tables summary)))
       (is (= 3 (:match-count summary)))
       (is (= [] (:missing-components summary)))
+      (is (= mv/recent-runtime-history-limit
+             (:recent-history-limit summary)))
+      (is (= 3 (:recent-history-count summary)))
       (is (= :row-refresh (get-in summary [:rows 0 :component])))
       (is (= 1700000001000 (get-in summary [:rows 0 :next-time-ms])))
       (is (= 12346 (get-in summary [:rows 1 :last-success-read-tso])))
       (is (= :log-purge (get-in summary [:rows 2 :component])))
-      (is (= 54321 (get-in summary [:rows 2 :last-purged-tso]))))))
+      (is (= 54321 (get-in summary [:rows 2 :last-purged-tso])))
+      (is (= :row-refresh (get-in summary [:recent-history 0 :component])))
+      (is (= 23457 (get-in summary [:recent-history 1 :read-tso])))
+      (is (= :log-purge (get-in summary [:recent-history 2 :component]))))))
 
 (deftest read-runtime-metadata-falls-back-to-timers
   (with-redefs [c/query (fn [_ [sql & _]]

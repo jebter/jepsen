@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
-from mview_report_common import format_store_text, require_recognized_store, summarize_store
+from mview_report_common import format_store_text, summarize_store
 
 
 def main():
@@ -12,10 +12,13 @@ def main():
     parser.add_argument('--json', action='store_true', help='Emit machine-readable JSON summary')
     args = parser.parse_args()
 
-    try:
-        report = require_recognized_store(summarize_store(Path(args.store_dir)))
-    except ValueError as exc:
-        parser.exit(1, f"{exc}\n")
+    report = summarize_store(Path(args.store_dir))
+    if not report.get('reportable_store'):
+        parser.exit(
+            1,
+            f"{args.store_dir} is not a reportable TiDB MV Jepsen store directory: "
+            "missing manifest, runtime logs, and workload summaries\n",
+        )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

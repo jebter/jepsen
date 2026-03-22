@@ -10,8 +10,12 @@
 (def timer-table "mysql.tidb_timers")
 (def mview-refresh-info-table "mysql.tidb_mview_refresh_info")
 (def mlog-purge-info-table "mysql.tidb_mlog_purge_info")
-(def refresh-lock-retry-count 5)
-(def refresh-lock-retry-ms 250)
+(def mview-refresh-hist-table "mysql.tidb_mview_refresh_hist")
+(def mlog-purge-hist-table "mysql.tidb_mlog_purge_hist")
+(def recent-runtime-history-limit 8)
+(def refresh-lock-retry-count 8)
+(def refresh-lock-retry-base-ms 250)
+(def refresh-lock-retry-max-ms 1000)
 
 (declare try-statements!)
 
@@ -196,6 +200,13 @@
      (re-find #"lock\(s\) could not be acquired immediately|NOWAIT is set"
               message))))
 
+(defn- refresh-lock-retry-delay-ms
+  [attempt]
+  (long
+   (min refresh-lock-retry-max-ms
+        (* refresh-lock-retry-base-ms
+           (bit-shift-left 1 (max 0 (dec attempt)))))))
+
 (defn- missing-object-error?
   [^java.sql.SQLException e]
   (let [message (str (.getMessage e))]
@@ -235,11 +246,12 @@
         (let [e (:error result)]
           (if (and (refresh-lock-conflict? e)
                    (< attempt refresh-lock-retry-count))
-            (do
+            (let [delay-ms (refresh-lock-retry-delay-ms attempt)]
               (info label "Retrying after transient lock conflict"
                     "attempt=" attempt
+                    "sleep-ms=" delay-ms
                     "error=" (.getMessage e))
-              (Thread/sleep refresh-lock-retry-ms)
+              (Thread/sleep delay-ms)
               (recur (inc attempt)))
             (throw e)))))))
 
@@ -478,25 +490,40 @@
   [row tokens]
   (let [fields         (timer-match-fields row)
         matched-tokens (matched-timer-tokens fields tokens)
-        event-status   (some-> (:event_status row) str/upper-case)]
-    {:id                (->long (:id row))
-     :namespace         (some-> (:namespace row) str)
-     :timer-key         (some-> (:timer_key row) str)
-     :time-zone         (some-> (:timezone row) str)
-     :sched-policy-type (some-> (:sched_policy_type row) str)
-     :sched-policy-expr (some-> (:sched_policy_expr row) str)
-     :hook-class        (some-> (:hook_class row) str)
-     :watermark         (printable-value (:watermark row))
-     :enable?           (boolean (and (some? (:enable row))
-                                      (not (zero? (long (:enable row))))))
-     :event-status      event-status
-     :event-id          (some-> (:event_id row) str)
-     :event-start       (printable-value (:event_start row))
-     :create-time       (printable-value (:create_time row))
-     :update-time       (printable-value (:update_time row))
-     :version           (->long (:version row))
-     :matched-tokens    matched-tokens
-     :matched-components (classify-timer-match matched-tokens)}))
+        event-status   (some-> (:event_status row) str/upper-case)
+        timer-ext      (printable-value (:timer_ext row))
+        timer-data     (printable-value (:timer_data row))
+        summary-data   (printable-value (:summary_data row))
+        event-data     (printable-value (:event_data row))]
+    (cond-> {:id                 (->long (:id row))
+             :namespace          (some-> (:namespace row) str)
+             :timer-key          (some-> (:timer_key row) str)
+             :time-zone          (some-> (:timezone row) str)
+             :sched-policy-type  (some-> (:sched_policy_type row) str)
+             :sched-policy-expr  (some-> (:sched_policy_expr row) str)
+             :hook-class         (some-> (:hook_class row) str)
+             :watermark          (printable-value (:watermark row))
+             :enable?            (boolean (and (some? (:enable row))
+                                               (not (zero? (long (:enable row))))))
+             :event-status       event-status
+             :event-id           (some-> (:event_id row) str)
+             :event-start        (printable-value (:event_start row))
+             :create-time        (printable-value (:create_time row))
+             :update-time        (printable-value (:update_time row))
+             :version            (->long (:version row))
+             :matched-tokens     matched-tokens
+             :matched-components (classify-timer-match matched-tokens)}
+      (not (str/blank? timer-ext))
+      (assoc :timer-ext timer-ext)
+
+      (not (str/blank? timer-data))
+      (assoc :timer-data timer-data)
+
+      (not (str/blank? summary-data))
+      (assoc :summary-data summary-data)
+
+      (not (str/blank? event-data))
+      (assoc :event-data event-data))))
 
 (defn read-timer-metadata
   [conn schedule-meta]
@@ -608,10 +635,136 @@
   (assoc (runtime-row-base :log-purge object-name mlog-purge-info-table row)
          :last-purged-tso (some-> row :last_purged_tso ->long)))
 
-(defn- read-system-runtime-metadata
+(defn- query-system-history-rows
+  [conn sql-prefix object-names]
+  (let [placeholders (str/join ", " (repeat (count object-names) "?"))
+        sql          (str sql-prefix
+                          " ("
+                          placeholders
+                          ") "
+                          "ORDER BY t.table_name, job_id DESC")]
+    (c/query conn (into [sql] object-names))))
+
+(defn- query-refresh-history-rows
+  [conn object-names]
+  (when (seq object-names)
+    (query-system-history-rows
+     conn
+     (str "SELECT t.table_name AS object_name, "
+          "t.tidb_table_id AS object_id, "
+          "h.refresh_job_id AS job_id, "
+          "CAST(ROUND(UNIX_TIMESTAMP(h.refresh_time) * 1000) AS SIGNED) AS start_time_ms, "
+          "CAST(ROUND(UNIX_TIMESTAMP(h.refresh_endtime) * 1000) AS SIGNED) AS end_time_ms, "
+          "h.refresh_status AS status, "
+          "h.refresh_rows AS row_count, "
+          "h.refresh_read_tso AS read_tso, "
+          "h.refresh_failed_reason AS failed_reason "
+          "FROM information_schema.tables t "
+          "JOIN " mview-refresh-hist-table " h ON h.mview_id = t.tidb_table_id "
+          "WHERE t.table_schema = DATABASE() AND t.table_name IN")
+     object-names)))
+
+(defn- query-purge-history-rows
+  [conn object-names]
+  (when (seq object-names)
+    (query-system-history-rows
+     conn
+     (str "SELECT t.table_name AS object_name, "
+          "t.tidb_table_id AS object_id, "
+          "h.purge_job_id AS job_id, "
+          "CAST(ROUND(UNIX_TIMESTAMP(h.purge_time) * 1000) AS SIGNED) AS start_time_ms, "
+          "CAST(ROUND(UNIX_TIMESTAMP(h.purge_endtime) * 1000) AS SIGNED) AS end_time_ms, "
+          "h.purge_status AS status, "
+          "h.purge_rows AS row_count, "
+          "h.purge_failed_reason AS failed_reason "
+          "FROM information_schema.tables t "
+          "JOIN " mlog-purge-hist-table " h ON h.mlog_id = t.tidb_table_id "
+          "WHERE t.table_schema = DATABASE() AND t.table_name IN")
+     object-names)))
+
+(defn- limit-history-rows
+  [rows limit]
+  (let [seen (volatile! {})]
+    (->> rows
+         (keep (fn [row]
+                 (let [object-name (some-> (:object_name row) str)
+                       object-count (get @seen object-name 0)]
+                   (when (< object-count limit)
+                     (vswap! seen assoc object-name (inc object-count))
+                     row))))
+         vec)))
+
+(defn- history-row-base
+  [component kind object-name system-table row]
+  (let [status        (some-> row :status str)
+        failed-reason (some-> row :failed_reason str)
+        start-time-ms (some-> row :start_time_ms ->long)
+        end-time-ms   (some-> row :end_time_ms ->long)]
+    (cond-> {:component      component
+             :kind           kind
+             :object         object-name
+             :system-table   system-table
+             :object-id      (some-> row :object_id ->long)
+             :job-id         (some-> row :job_id ->long)
+             :status         status
+             :start-time-ms  start-time-ms
+             :end-time-ms    end-time-ms
+             :duration-ms    (when (and start-time-ms end-time-ms)
+                               (- end-time-ms start-time-ms))
+             :row-count      (some-> row :row_count ->long)
+             :success?       (when status
+                               (= "SUCCESS" (str/upper-case status)))}
+      (not (str/blank? failed-reason))
+      (assoc :failed-reason failed-reason))))
+
+(defn- normalize-refresh-history-row
+  [component object-name row]
+  (assoc (history-row-base component
+                           :refresh
+                           object-name
+                           mview-refresh-hist-table
+                           row)
+         :read-tso (some-> row :read_tso ->long)))
+
+(defn- normalize-purge-history-row
+  [object-name row]
+  (history-row-base :log-purge
+                    :purge
+                    object-name
+                    mlog-purge-hist-table
+                    row))
+
+(defn- read-recent-runtime-history
   [conn {:keys [log-table]}]
   (try
-    (let [refresh-rows      (query-refresh-runtime-rows conn [row-view agg-view])
+    (let [refresh-history (limit-history-rows
+                           (query-refresh-history-rows conn [row-view agg-view])
+                           recent-runtime-history-limit)
+          purge-history   (limit-history-rows
+                           (when log-table
+                             (query-purge-history-rows conn [log-table]))
+                           recent-runtime-history-limit)
+          rows            (vec
+                           (concat
+                            (map #(normalize-refresh-history-row :row-refresh row-view %) (filter (comp #{row-view} :object_name) refresh-history))
+                            (map #(normalize-refresh-history-row :agg-refresh agg-view %) (filter (comp #{agg-view} :object_name) refresh-history))
+                            (map #(normalize-purge-history-row log-table %) purge-history)))]
+      {:available? true
+       :tables     (cond-> [mview-refresh-hist-table]
+                     log-table (conj mlog-purge-hist-table))
+       :rows       rows
+       :limit      recent-runtime-history-limit})
+    (catch java.sql.SQLException e
+      {:available? false
+       :tables     (cond-> [mview-refresh-hist-table]
+                     log-table (conj mlog-purge-hist-table))
+       :error      (.getMessage e)})))
+
+(defn- read-system-runtime-metadata
+  [conn schedule-meta]
+  (try
+    (let [log-table         (:log-table schedule-meta)
+          refresh-rows      (query-refresh-runtime-rows conn [row-view agg-view])
           refresh-by-object (index-rows-by-object-name refresh-rows)
           purge-by-object   (when log-table
                               (-> (query-purge-runtime-rows conn [log-table])
@@ -625,23 +778,39 @@
                               log-table
                               (conj (normalize-purge-runtime-row log-table
                                                                  (get purge-by-object log-table))))
+          history-meta      (read-recent-runtime-history conn {:log-table log-table})
+          timer-meta        (read-timer-metadata conn schedule-meta)
           missing-components (->> rows
                                   (remove :info-present?)
                                   (map :component)
                                   vec)]
-      {:available?          true
-       :source              :system-tables
-       :tables              (cond-> [mview-refresh-info-table]
-                              log-table (conj mlog-purge-info-table))
-       :expected-components (mapv :component rows)
-       :match-count         (count (filter :info-present? rows))
-       :rows                rows
-       :missing-components  missing-components})
+      (cond-> {:available?          true
+               :source              :system-tables
+               :tables              (cond-> [mview-refresh-info-table]
+                                      log-table (conj mlog-purge-info-table))
+               :expected-components (mapv :component rows)
+               :match-count         (count (filter :info-present? rows))
+               :rows                rows
+               :missing-components  missing-components
+               :history-tables      (:tables history-meta)
+               :recent-history-limit recent-runtime-history-limit}
+        (:available? history-meta)
+        (assoc :recent-history       (:rows history-meta)
+               :recent-history-count (count (:rows history-meta)))
+
+        (not (:available? history-meta))
+        (assoc :history-error (:error history-meta))
+
+        (:available? timer-meta)
+        (assoc :timer-metadata timer-meta)
+
+        (not (:available? timer-meta))
+        (assoc :timer-error (:error timer-meta))))
     (catch java.sql.SQLException e
       {:available? false
        :source    :system-tables
        :tables    (cond-> [mview-refresh-info-table]
-                    log-table (conj mlog-purge-info-table))
+                    (:log-table schedule-meta) (conj mlog-purge-info-table))
        :error     (.getMessage e)})))
 
 (defn read-runtime-metadata

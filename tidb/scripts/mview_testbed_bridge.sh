@@ -205,6 +205,23 @@ print(json.dumps(data, separators=(",", ":")))
 PY
 }
 
+start_detached_process() {
+  python3 - "$@" <<'PY'
+import subprocess
+import sys
+
+proc = subprocess.Popen(
+    sys.argv[1:],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+    close_fds=True,
+)
+print(proc.pid)
+PY
+}
+
 start_sql_tunnels() {
   local workdir="$1"
   local kubeconfig="$2"
@@ -227,7 +244,7 @@ start_sql_tunnels() {
     log_file="$(sql_tunnel_log_file "$workdir" "$index")"
     : >"$log_file"
 
-    nohup bash -c '
+    pid="$(start_detached_process bash -c '
       set -euo pipefail
       kubeconfig="$1"
       namespace="$2"
@@ -258,8 +275,7 @@ start_sql_tunnels() {
           "$(date +%Y-%m-%dT%H:%M:%S%z)" "$index" >>"$log_file"
         sleep 0.2
       done
-    ' bash "$kubeconfig" "$namespace" "$index" "$port" "$log_file" >/dev/null 2>&1 </dev/null &
-    pid=$!
+    ' bash "$kubeconfig" "$namespace" "$index" "$port" "$log_file")"
     printf '%s\n' "$pid" >>"$pid_file"
 
     if ! wait_for_port_forward "$pid" "$port" "$log_file"; then
@@ -318,6 +334,29 @@ namespace_phase() {
   KUBECONFIG="$kubeconfig" kubectl get namespace "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || true
 }
 
+testbed_state_in_tcctl_list() {
+  local testbed="$1"
+  local output=""
+  local rc=0
+
+  set +e
+  output="$(tcctl testbed list 2>/dev/null)"
+  rc=$?
+  set -e
+
+  if ((rc != 0)); then
+    printf 'error'
+    return 0
+  fi
+
+  if awk -v testbed="$testbed" 'NR > 1 && $1 == testbed { found = 1 } END { exit(found ? 0 : 1) }' <<<"$output"; then
+    printf 'present'
+    return 0
+  fi
+
+  printf 'absent'
+}
+
 create_tcctl_testbed() {
   local workdir="$1"
   local spec="$2"
@@ -357,6 +396,7 @@ wait_for_namespace_gone() {
   local elapsed=0
   local output=""
   local rc=0
+  local list_state=""
 
   while ((elapsed <= timeout_seconds)); do
     set +e
@@ -375,6 +415,17 @@ wait_for_namespace_gone() {
     else
       if grep -qi 'not found' <<<"$output"; then
         return 0
+      fi
+      if grep -qi 'forbidden' <<<"$output"; then
+        list_state="$(testbed_state_in_tcctl_list "$namespace")"
+        if [[ "$list_state" == "absent" ]]; then
+          return 0
+        fi
+        if [[ "$list_state" == "present" ]]; then
+          sleep 2
+          elapsed=$((elapsed + 2))
+          continue
+        fi
       fi
       printf 'query-error:%s' "$output"
       return 1
