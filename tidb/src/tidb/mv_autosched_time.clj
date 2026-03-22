@@ -1,6 +1,7 @@
 (ns tidb.mv-autosched-time
   (:refer-clojure :exclude [test])
   (:require [clojure.pprint :refer [pprint]]
+            [clojure.string :as str]
             [jepsen
              [checker :as checker]
              [store :as store]]
@@ -144,6 +145,23 @@
   [op]
   (and (clock-op? op)
        (contains? op :clock-offsets)))
+
+(defn- clock-op-support-error
+  [op]
+  (let [error (:error op)]
+    (when (and (clock-op? op)
+               (string? error)
+               (or (str/includes? error "settimeofday: Operation not permitted")
+                   (str/includes? error "Operation not permitted")))
+      error)))
+
+(defn- first-unsupported-clock-op
+  [history]
+  (some (fn [op]
+          (when-let [error (clock-op-support-error op)]
+            (assoc (select-keys op [:f :value])
+                   :error error)))
+        history))
 
 (defn- ok-snapshot-op?
   [op]
@@ -574,6 +592,9 @@
 (defn time-analysis
   [test history snapshots]
   (let [requested?                 (boolean (:clock-skew (or (:nemesis-spec test) {})))
+        unsupported-clock-op       (when requested?
+                                     (first-unsupported-clock-op history))
+        clock-skew-supported?      (nil? unsupported-clock-op)
         snapshots                  (ordered-snapshots snapshots)
         snapshot-series            (snapshots-by-node snapshots)
         node-analysis              (into (sorted-map)
@@ -753,22 +774,29 @@
                    {:runtime-metadata runtime-summary}))
         clause-unverified-warning  (first-best-effort-clause-missing-warning metadata-summary)
         hard-anomalies             (cond-> []
-                                     (and requested? (empty? clock-ops))
+                                     (and requested? (not clock-skew-supported?))
+                                     (conj (anomaly :clock-skew-unsupported
+                                                    :hard
+                                                    "clock-skew was requested but the test environment could not adjust system time"
+                                                    {:first-clock-failure unsupported-clock-op}))
+
+                                     (and requested? clock-skew-supported? (empty? clock-ops))
                                      (conj (anomaly :missing-clock-events
                                                     :hard
                                                     "clock-skew was requested but no clock events were recorded"))
 
-                                     (and requested? (empty? skew-ops))
+                                     (and requested? clock-skew-supported? (empty? skew-ops))
                                      (conj (anomaly :missing-skew-injection
                                                     :hard
                                                     "clock-skew was requested but no bump/strobe operation completed"))
 
-                                     (and requested? (empty? reset-ops))
+                                     (and requested? clock-skew-supported? (empty? reset-ops))
                                      (conj (anomaly :missing-clock-reset
                                                     :hard
                                                     "clock-skew was requested but no reset-clock operation completed"))
 
                                      (and requested?
+                                          clock-skew-supported?
                                           (some? (:max-abs-offset-ms residual-offsets))
                                           (> (:max-abs-offset-ms residual-offsets)
                                              residual-clock-offset-budget-ms))
@@ -829,8 +857,10 @@
                                      clause-unverified-warning
                                      (conj clause-unverified-warning))]
     {:warning                  skeleton-warning
-     :clock-skew-supported?    true
+     :clock-skew-supported?    clock-skew-supported?
      :clock-skew-requested?    requested?
+     :clock-skew-support-error (some-> unsupported-clock-op :error)
+     :first-clock-failure      unsupported-clock-op
      :snapshot-count           (count snapshots)
      :converged-snapshot-count (reduce + 0 (map :converged-snapshot-count node-summaries))
      :quiet-window-ms          quiet-window-ms
@@ -876,8 +906,10 @@
         (let [summary {:valid?                   (empty? anomalies)
                        :experimental?            true
                        :warning                  skeleton-warning
-                       :clock-skew-supported?    true
+                       :clock-skew-supported?    (:clock-skew-supported? analysis)
                        :clock-skew-requested?    (:clock-skew-requested? analysis)
+                       :clock-skew-support-error (:clock-skew-support-error analysis)
+                       :first-clock-failure      (:first-clock-failure analysis)
                        :snapshot-count           (:snapshot-count analysis)
                        :raw-snapshot-count       (:raw-snapshot-count analysis)
                        :ignored-pre-reset-snapshot-count (:ignored-pre-reset-snapshot-count analysis)

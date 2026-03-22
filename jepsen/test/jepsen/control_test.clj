@@ -51,6 +51,28 @@
           (is (= :session (rc/conn session)))
           (rc/close! session))))))
 
+(deftest session-retries-jsch-connect-npe-while-opening
+  (let [calls (atom 0)
+        npe   (doto (NullPointerException.)
+                (.setStackTrace
+                 (into-array
+                  StackTraceElement
+                  [(StackTraceElement.
+                    "com.jcraft.jsch.Session"
+                    "connect"
+                    "Session.java"
+                    256)])))]
+    (with-redefs [c/clj-ssh-session (fn [_]
+                                      (if (= 1 (swap! calls inc))
+                                        (throw npe)
+                                        :session))
+                  ssh/disconnect     identity]
+      (c/with-ssh {:dummy? false}
+        (let [session (c/session "n1")]
+          (is (= 2 @calls))
+          (is (= :session (rc/conn session)))
+          (rc/close! session))))))
+
 (deftest retryable-jsch-exception-test
   (is (true? (#'c/retryable-jsch-exception?
               (JSchException. "channel is not opened."))))

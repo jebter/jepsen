@@ -16,7 +16,9 @@ mview_init_base_env() {
   CONCURRENCY="${CONCURRENCY:-2n}"
   NODES="${NODES:-${JEPSEN_NODES:-}}"
   SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-${JEPSEN_SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}}"
+  JEPSEN_BEST_EFFORT_NET="${JEPSEN_BEST_EFFORT_NET:-1}"
   TXN_MODE="${TXN_MODE:-optimistic}"
+  export JEPSEN_BEST_EFFORT_NET
 }
 
 mview_init_time_limit() {

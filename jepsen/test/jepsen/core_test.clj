@@ -141,8 +141,14 @@
                                           ["/opt/tidb/db.log"
                                            "/opt/tidb/pd.log"])))]
     (with-redefs [control/on-nodes
-                  (fn [test f]
-                    {"n1" (f test "n1")})
+                  (fn
+                    ([test f]
+                     {"n1" (f test "n1")})
+                    ([test nodes f]
+                     (into {}
+                           (map (fn [node]
+                                  [node (f test node)]))
+                           nodes)))
                   control/download
                   (fn [remote local]
                     (swap! retries-seen conj control/*retries*)
@@ -293,3 +299,48 @@
     (testing "client close"     (is (thrown-with-msg? AssertionError #"false" (test :close nil))))
     (testing "nemesis setup"    (is (thrown-with-msg? AssertionError #"false" (test :setup nil))))
     (testing "nemesis teardown" (is (thrown-with-msg? AssertionError #"false" (test :teardown nil))))))
+
+(deftest snarf-logs-skips-ssh-when-no-log-files
+  (let [update-symlinks-calls (atom 0)
+        ssh-calls             (atom 0)
+        test                  {:db    (reify db/LogFiles
+                                        (log-files [_ _ _] nil))
+                               :nodes ["n1" "n2"]}]
+    (with-redefs [control/on-nodes (fn [& _]
+                                     (swap! ssh-calls inc)
+                                     (throw (ex-info "should not open ssh sessions" {})))
+                  store/update-symlinks! (fn [_]
+                                           (swap! update-symlinks-calls inc))]
+      (snarf-logs! test)
+      (is (zero? @ssh-calls))
+      (is (= 1 @update-symlinks-calls)))))
+
+(deftest snarf-logs-only-targets-nodes-with-log-files
+  (let [downloaded            (atom [])
+        visited-nodes         (atom nil)
+        update-symlinks-calls (atom 0)
+        test                  {:db    (reify db/LogFiles
+                                        (log-files [_ _ node]
+                                          (case node
+                                            "n1" ["/var/log/tidb.log"]
+                                            "n2" []
+                                            "n3" ["/var/log/pd.log"])))
+                               :nodes ["n1" "n2" "n3"]}]
+    (with-redefs [control/on-nodes (fn [test nodes f]
+                                     (reset! visited-nodes (vec nodes))
+                                     (into {}
+                                           (map (fn [node]
+                                                  [node (f test node)])
+                                                nodes)))
+                  control/download (fn [remote local]
+                                     (swap! downloaded conj [remote local]))
+                  store/path! (fn [_ & segments]
+                                (java.io.File. "/tmp" (str/join "/" segments)))
+                  store/update-symlinks! (fn [_]
+                                           (swap! update-symlinks-calls inc))]
+      (snarf-logs! test)
+      (is (= ["n1" "n3"] @visited-nodes))
+      (is (= 2 (count @downloaded)))
+      (is (= #{"/var/log/tidb.log" "/var/log/pd.log"}
+             (set (map first @downloaded))))
+      (is (= 1 @update-symlinks-calls)))))

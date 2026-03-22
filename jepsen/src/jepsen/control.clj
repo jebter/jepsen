@@ -358,12 +358,12 @@
       (.setServerAliveCountMax ssh-server-alive-count-max)
       (ssh/connect))))
 
-(defn- jsch-session-read-npe?
+(defn- jsch-session-open-npe?
   [t]
   (and (instance? NullPointerException t)
        (some (fn [^StackTraceElement frame]
                (and (= "com.jcraft.jsch.Session" (.getClassName frame))
-                    (= "read" (.getMethodName frame))))
+                    (#{"connect" "read"} (.getMethodName frame))))
              (.getStackTrace t))))
 
 (defn- session-open-error-data
@@ -387,7 +387,7 @@
                               (clj-ssh-session host)
                               (catch Object t
                                 (if (and (pos? tries)
-                                         (or (jsch-session-read-npe? t)
+                                         (or (jsch-session-open-npe? t)
                                              (and (instance? JSchException t)
                                                   (retryable-jsch-exception? t))))
                                   (do
