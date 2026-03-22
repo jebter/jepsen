@@ -404,6 +404,8 @@
                     (str " txn-mode " (:txn-mode opts)))
                   (when (:isolation opts)
                     (str " isolation " (:isolation opts)))
+                  (when-let [run-tag (:run-tag opts)]
+                    (str " run-tag " run-tag))
                   (when-not (= [:interval] (keys (:nemesis opts)))
                     (str " nemesis " (->> (dissoc (:nemesis opts)
                                                   :interval
@@ -661,6 +663,9 @@
 
    [nil "--init-txn-sql STMTS", "Randomly choose one of these statements, execute it before transactions"
     :parse-fn parse-sql-stmts
+    :default nil]
+
+   [nil "--run-tag TAG" "Optional suffix added to the test name so wrappers can locate this run's store artifacts unambiguously."
     :default nil]
 
    [nil "--skip-collect-logs" "If present, skips collecting logs after the test."

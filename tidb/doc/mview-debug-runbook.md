@@ -60,6 +60,7 @@ Examples:
 lein run test --workload mv-stateful --nemesis none --time-limit 300 --test-count 1 --concurrency 2n --tarball-url <tarball-url> --binary-urls <binary-urls>
 lein run test --workload mv-lifecycle --nemesis none --time-limit 300 --test-count 1 --concurrency 2n --tarball-url <tarball-url> --binary-urls <binary-urls>
 WORKLOAD_FILTER=mv-lifecycle scripts/mview_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
+MAX_PARALLEL=3 WORKLOAD_FILTER=mv-lifecycle scripts/mview_parallel_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
 ```
 
 ## Bridge-backed direct runs
@@ -71,6 +72,7 @@ Rules:
 - sourcing `bridge.env.sh` is enough for raw `lein run test` as long as you do not override nodes or SSH key with conflicting flags
 - explicit `--nodes` and `--ssh-private-key` still override the bridge env and remain useful for debugging command construction
 - the `scripts/mview_run_and_report.sh` and suite wrappers also pick up the bridge node and SSH env automatically
+- `scripts/mview_parallel_suite_run_and_report.sh` creates a fresh bridge-backed testbed per case, so it is the safe path when you want bounded parallelism instead of multiple cases sharing one sourced bridge env
 - for hosted automation that may reap background child processes after `create` returns, prefer `scripts/mview_testbed_bridge.sh exec ... -- <command...>` so the SQL tunnels stay alive in the same session as the Jepsen run
 
 Example:

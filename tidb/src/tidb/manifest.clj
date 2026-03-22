@@ -77,6 +77,9 @@
                 (:isolation test)
                 (conj (cli-opt "--isolation" (name (:isolation test))))
 
+                (present? (:run-tag test))
+                (conj (cli-opt "--run-tag" (:run-tag test)))
+
                 (not= :default (:auto-retry test))
                 (conj (cli-opt "--auto-retry" (:auto-retry test)))
 
@@ -147,6 +150,7 @@
              :concurrency (:concurrency test)
              :generated_at (str (:start-time test))
              :repro_command (repro-command test))
+      (assoc-present :run_tag (:run-tag test))
       (assoc-present :notes (:build-notes test))))
 
 (defn write-manifest!

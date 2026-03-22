@@ -316,6 +316,30 @@
         (is (= [:old] @aborted-calls))
         (is (= new-conn @conn-holder))))))
 
+(deftest stateful-client-setup-uses-extended-timeout
+  (let [conn-holder   (atom nil)
+        schema-created (atom false)
+        mv-client      (stateful/->MVStatefulClient conn-holder :n1 schema-created)
+        setup-calls    (atom [])
+        seen-timeouts  (atom [])]
+    (with-redefs [c/open                    (fn [_ _] ::setup-conn)
+                  stateful/run-with-op-timeout!
+                  (fn [_ _ f timeout-ms]
+                    (swap! seen-timeouts conj timeout-ms)
+                    (f))
+                  mv/setup-stateful-schema! (fn [conn ids]
+                                              (swap! setup-calls conj {:conn conn
+                                                                       :ids  (vec ids)})
+                                              nil)]
+      (client/setup! mv-client {:concurrency 3})
+      (client/setup! mv-client {:concurrency 5})
+      (is (= [stateful/setup-timeout-ms] @seen-timeouts))
+      (is (= [{:conn ::setup-conn
+               :ids  [1 2 3]}]
+             @setup-calls))
+      (is (true? @schema-created))
+      (is (= ::setup-conn @conn-holder)))))
+
 (deftest stateful-verify-write-falls-back-to-other-nodes
   (let [token       "mv-stateful-verify-fallback-token"
         op          {:type :invoke
@@ -1475,6 +1499,52 @@
     (is (= 2 (get-in validated [:result :candidate-count])))
     (is (= 1 (get-in validated [:result :overlapping-write-count])))))
 
+(deftest stateful-refresh-window-validation-skips-large-candidate-search
+  (binding [stateful/refresh-window-max-candidates 1]
+    (let [history (vec
+                   (concat
+                    (lifecycle-write-events
+                     1 2 1 :update-value
+                     {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5" :deleted false :pad "pad-v5"})
+                    (stateful-refresh-events
+                     3 6 :refresh-row 2 :fail
+                     {:id 2
+                      :diff {:expected {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6"}
+                             :actual   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5"}}})
+                    (lifecycle-write-events
+                     4 5 1 :update-value
+                     {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6" :deleted false :pad "pad-v6"})))
+          validated (validate-stateful-refresh-history history)]
+      (is (= :fail (:type validated)))
+      (is (true? (get-in validated [:result :window-validation-skipped?])))
+      (is (= :candidate-limit
+             (get-in validated [:result :window-validation-skip-reason])))
+      (is (= 2 (get-in validated [:result :candidate-count])))
+      (is (= 1 (get-in validated [:result :overlapping-write-count]))))))
+
+(deftest stateful-refresh-window-validation-skips-wide-overlapping-window
+  (binding [stateful/refresh-window-max-overlapping-writes 0]
+    (let [history (vec
+                   (concat
+                    (lifecycle-write-events
+                     1 2 1 :update-value
+                     {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5" :deleted false :pad "pad-v5"})
+                    (stateful-refresh-events
+                     3 6 :refresh-row 2 :fail
+                     {:id 2
+                      :diff {:expected {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6"}
+                             :actual   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5"}}})
+                    (lifecycle-write-events
+                     4 5 1 :update-value
+                     {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6" :deleted false :pad "pad-v6"})))
+          validated (validate-stateful-refresh-history history)]
+      (is (= :fail (:type validated)))
+      (is (true? (get-in validated [:result :window-validation-skipped?])))
+      (is (= :overlapping-write-limit
+             (get-in validated [:result :window-validation-skip-reason])))
+      (is (= 2 (get-in validated [:result :candidate-count])))
+      (is (= 1 (get-in validated [:result :overlapping-write-count]))))))
+
 (deftest stateful-refresh-window-validation-allows-overlapping-agg-write-to-be-excluded
   (let [history (vec
                  (concat
@@ -1694,6 +1764,33 @@
     (is (= 1 (:window-compatible-row-count summary)))
     (is (nil? (:first-row-failure summary)))
     (is (nil? (:first-failure summary)))))
+
+(deftest stateful-checker-stays-valid-when-window-compatible-search-is-skipped
+  (binding [stateful/refresh-window-max-candidates 1]
+    (let [history (vec
+                   (concat
+                    (lifecycle-write-events
+                     1 2 1 :update-value
+                     {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5" :deleted false :pad "pad-v5"})
+                    (stateful-refresh-events
+                     3 6 :refresh-row 2 :fail
+                     {:id 2
+                      :diff {:expected {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6"}
+                             :actual   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5"}}})
+                    (lifecycle-write-events
+                     4 5 1 :update-value
+                     {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6" :deleted false :pad "pad-v6"})
+                    [{:type :ok :phase :final :f :refresh-row :process 0 :result {:rows 1}}
+                     {:type :ok :phase :final :f :refresh-agg :process 0 :result {:groups 1}}]))
+          summary (checker/check (stateful/checker*) {} history nil)]
+      (is (true? (:valid? summary)))
+      (is (true? (:final-row-valid? summary)))
+      (is (true? (:final-agg-valid? summary)))
+      (is (= 1 (:refresh-row-fail-count summary)))
+      (is (= 1 (:active-refresh-row-fail-count summary)))
+      (is (= 0 (:window-compatible-row-count summary)))
+      (is (= :refresh-row (:f (:first-row-failure summary))))
+      (is (= :refresh-row (:f (:first-active-row-failure summary)))))))
 
 (deftest stateful-checker-still-fails-when-final-refresh-fails
   (let [history [{:type :ok :phase :final :f :refresh-row :process 0 :result {:rows 1}}

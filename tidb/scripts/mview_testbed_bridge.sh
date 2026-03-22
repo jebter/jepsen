@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_SPEC="$ROOT_DIR/jepsen-testbed.yaml"
 CREATE_RETRY_LIMIT="${CREATE_RETRY_LIMIT:-3}"
 CREATE_RETRY_DELAY_SECONDS="${CREATE_RETRY_DELAY_SECONDS:-5}"
+CREATE_QUOTA_RETRY_LIMIT="${CREATE_QUOTA_RETRY_LIMIT:-$CREATE_RETRY_LIMIT}"
+CREATE_QUOTA_RETRY_DELAY_SECONDS="${CREATE_QUOTA_RETRY_DELAY_SECONDS:-$CREATE_RETRY_DELAY_SECONDS}"
 CLEANUP_WAIT_SECONDS="${CLEANUP_WAIT_SECONDS:-30}"
 
 usage() {
@@ -381,7 +383,7 @@ tcctl_get_testbed_raw() {
 
 tcctl_testbed_missing() {
   local output="${1:-}"
-  grep -qiE '^Error: namespace .+ not found$' <<<"$output"
+  grep -qiE '^Error: (namespace )?[^[:space:]]+ not found$' <<<"$output"
 }
 
 sanitize_tcctl_output() {
@@ -390,14 +392,24 @@ sanitize_tcctl_output() {
     '/^[A-Z][0-9]{4} .*testbed_list\.go:96\] list testbed of [^ ]+ failed: list testbeds error: .* not found$/d'
 }
 
+tcctl_create_quota_limited() {
+  local output="${1:-}"
+  grep -qi 'toomanyrequests: reach your testbed quota limit' <<<"$output"
+}
+
 create_tcctl_testbed() {
   local workdir="$1"
   local spec="$2"
   local attempt=1
+  local max_attempts="$CREATE_RETRY_LIMIT"
   local output=""
   local rc=0
 
-  while ((attempt <= CREATE_RETRY_LIMIT)); do
+  if ((CREATE_QUOTA_RETRY_LIMIT > max_attempts)); then
+    max_attempts="$CREATE_QUOTA_RETRY_LIMIT"
+  fi
+
+  while ((attempt <= max_attempts)); do
     set +e
     output="$(cd "$workdir" && tcctl testbed create -f "$spec" --credential kubeconfig.yml --output-spec '{"output":"output"}' 2>&1)"
     rc=$?
@@ -413,6 +425,15 @@ create_tcctl_testbed() {
       if ((attempt < CREATE_RETRY_LIMIT)); then
         echo "transient tcctl create error on attempt $attempt/$CREATE_RETRY_LIMIT, retrying in ${CREATE_RETRY_DELAY_SECONDS}s" >&2
         sleep "$CREATE_RETRY_DELAY_SECONDS"
+        ((attempt++))
+        continue
+      fi
+    fi
+
+    if tcctl_create_quota_limited "$output"; then
+      if ((attempt < CREATE_QUOTA_RETRY_LIMIT)); then
+        echo "tcctl create hit testbed quota on attempt $attempt/$CREATE_QUOTA_RETRY_LIMIT, retrying in ${CREATE_QUOTA_RETRY_DELAY_SECONDS}s" >&2
+        sleep "$CREATE_QUOTA_RETRY_DELAY_SECONDS"
         ((attempt++))
         continue
       fi
