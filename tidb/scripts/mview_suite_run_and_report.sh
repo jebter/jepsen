@@ -36,13 +36,9 @@ case "$SUITE" in
     ;;
 esac
 
-before_file="$(mktemp)"
-after_file="$(mktemp)"
-trap 'rm -f "$before_file" "$after_file"' EXIT
-
 if [[ -z "$SUITE_OUTPUT_DIR" ]]; then
   timestamp="$(date +%Y%m%dT%H%M%S)"
-  SUITE_OUTPUT_DIR="$ROOT_DIR/store/suites/${SUITE}-${timestamp}"
+  SUITE_OUTPUT_DIR="$ROOT_DIR/store/suites/${SUITE}-${timestamp}-$$-$RANDOM"
 fi
 export MVIEW_SUITE_OUTPUT_DIR="$SUITE_OUTPUT_DIR"
 export MVIEW_RUNNER_LOG="${MVIEW_RUNNER_LOG:-$SUITE_OUTPUT_DIR/runner.log}"
@@ -50,8 +46,6 @@ export MVIEW_STATUS_TSV="${MVIEW_STATUS_TSV:-$SUITE_OUTPUT_DIR/status.tsv}"
 export MVIEW_CASE_LOG_DIR="${MVIEW_CASE_LOG_DIR:-$SUITE_OUTPUT_DIR/case-logs}"
 mview_init_suite_outputs
 mview_log_progress "suite start suite=$SUITE tarball=$TARBALL_URL binary_urls=${BINARY_URLS:-none}"
-
-mview_list_store_dirs > "$before_file"
 
 suite_args=("$TARBALL_URL")
 [[ -n "$BINARY_URLS" ]] && suite_args+=("$BINARY_URLS")
@@ -62,12 +56,11 @@ else
   suite_exit=$?
 fi
 
-mview_list_store_dirs > "$after_file"
 new_store_dirs=()
 while IFS= read -r store_dir; do
   [[ -z "$store_dir" ]] && continue
   new_store_dirs+=("$store_dir")
-done < <(mview_diff_store_dirs "$before_file" "$after_file")
+done < <(mview_collect_store_dirs_from_status "$MVIEW_STATUS_TSV")
 
 if [[ ${#new_store_dirs[@]} -gt 0 ]]; then
   for store_dir in "${new_store_dirs[@]}"; do

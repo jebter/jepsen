@@ -33,17 +33,22 @@ case "$WORKLOAD" in
 esac
 
 NEMESIS="${NEMESIS:-$(mview_default_nemesis_for "$WORKLOAD")}"
+RUN_TAG="${MVIEW_RUN_TAG:-$(mview_make_run_tag "$WORKLOAD")}"
 mview_populate_build_args
 mview_warn_if_experimental "$WORKLOAD"
-mview_run_test "$WORKLOAD" "$NEMESIS" "$TIME_LIMIT"
+mview_run_test "$WORKLOAD" "$NEMESIS" "$TIME_LIMIT" "$RUN_TAG"
 
-store_dir="$(mview_latest_store_dir)"
+store_dir="${MVIEW_LAST_STORE_DIR:-}"
+if [[ -z "$store_dir" ]]; then
+  store_dir="$(mview_store_dir_for_run_tag "$RUN_TAG")"
+fi
 REPORT_JSON_OUT="${REPORT_JSON_OUT:-$store_dir/mview-report.json}"
 REPORT_TEXT_OUT="${REPORT_TEXT_OUT:-$store_dir/mview-report.txt}"
 
 mview_write_store_report "$store_dir" "$REPORT_JSON_OUT" "$REPORT_TEXT_OUT"
 
 echo "==> store: $store_dir"
+echo "==> run tag: $RUN_TAG"
 echo "==> report json: $REPORT_JSON_OUT"
 echo "==> report text: $REPORT_TEXT_OUT"
 

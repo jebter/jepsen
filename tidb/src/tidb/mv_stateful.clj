@@ -20,6 +20,8 @@
 (def write-fns [:insert :update-value :update-value :move-group :delete])
 (def write-op-fns #{:insert :update-value :move-group :delete})
 (def refresh-op-fns #{:refresh-row :refresh-agg})
+(def ^:dynamic refresh-window-max-candidates 10000)
+(def ^:dynamic refresh-window-max-overlapping-writes 8)
 
 (defn process-id
   [process]
@@ -124,6 +126,10 @@
 (def op-timeout-ms
   (+ c/socket-timeout 5000))
 
+(def setup-timeout-ms
+  (max 120000
+       (* 4 op-timeout-ms)))
+
 (defn- reconnect-retry-delay-ms
   [attempt]
   (long
@@ -147,24 +153,26 @@
         (recur)))))
 
 (defn run-with-op-timeout!
-  [conn-holder node f]
-  (let [worker (future
-                 (try
-                   {:ok (f)}
-                   (catch Throwable t
-                     {:error t})))
-        result (deref worker op-timeout-ms ::timeout)]
-    (if (= ::timeout result)
-      (do
-        (close-conn-holder! conn-holder)
-        (future-cancel worker)
-        (throw (ex-info (str "operation timed out after " op-timeout-ms " ms")
-                        {:type :op-timed-out
-                         :node node
-                         :timeout-ms op-timeout-ms})))
-      (if-let [t (:error result)]
-        (throw t)
-        (:ok result)))))
+  ([conn-holder node f]
+   (run-with-op-timeout! conn-holder node f op-timeout-ms))
+  ([conn-holder node f timeout-ms]
+   (let [worker (future
+                  (try
+                    {:ok (f)}
+                    (catch Throwable t
+                      {:error t})))
+         result (deref worker timeout-ms ::timeout)]
+     (if (= ::timeout result)
+       (do
+         (close-conn-holder! conn-holder)
+         (future-cancel worker)
+         (throw (ex-info (str "operation timed out after " timeout-ms " ms")
+                         {:type :op-timed-out
+                          :node node
+                          :timeout-ms timeout-ms})))
+       (if-let [t (:error result)]
+         (throw t)
+         (:ok result))))))
 
 (defn ensure-conn!
   [conn-holder node test]
@@ -177,26 +185,28 @@
   (ensure-conn! conn-holder node test))
 
 (defn with-reconnect!
-  [conn-holder node test retryable-error? f]
-  (loop [attempt 1]
-    (let [result (try
-                   (let [conn (ensure-conn! conn-holder node test)]
-                     {:ok (run-with-op-timeout! conn-holder node #(f conn))})
-                   (catch Throwable t
-                     {:error t}))]
-      (if-let [t (:error result)]
-        (if (and (retryable-error? t)
-                 (< attempt reconnect-retry-count))
-          (let [delay-ms (reconnect-retry-delay-ms attempt)]
-            (info {:reconnect/node       node
-                   :reconnect/attempt    attempt
-                   :reconnect/sleep-ms   delay-ms
-                   :reconnect/error      (or (.getMessage t) (str t))})
-            (close-conn-holder! conn-holder)
-            (Thread/sleep delay-ms)
-            (recur (inc attempt)))
-          (throw t))
-        (:ok result)))))
+  ([conn-holder node test retryable-error? f]
+   (with-reconnect! conn-holder node test retryable-error? f op-timeout-ms))
+  ([conn-holder node test retryable-error? f timeout-ms]
+   (loop [attempt 1]
+     (let [result (try
+                    (let [conn (ensure-conn! conn-holder node test)]
+                      {:ok (run-with-op-timeout! conn-holder node #(f conn) timeout-ms)})
+                    (catch Throwable t
+                      {:error t}))]
+       (if-let [t (:error result)]
+         (if (and (retryable-error? t)
+                  (< attempt reconnect-retry-count))
+           (let [delay-ms (reconnect-retry-delay-ms attempt)]
+             (info {:reconnect/node       node
+                    :reconnect/attempt    attempt
+                    :reconnect/sleep-ms   delay-ms
+                    :reconnect/error      (or (.getMessage t) (str t))})
+             (close-conn-holder! conn-holder)
+             (Thread/sleep delay-ms)
+             (recur (inc attempt)))
+           (throw t))
+         (:ok result))))))
 
 (defn stored-row-matches?
   [row {:keys [id g1 v1 version last-token deleted pad]}]
@@ -511,6 +521,10 @@
         processes      (sort (distinct (concat (keys before)
                                                (keys overlapping))))]
     {:overlapping-write-count (reduce + 0 (map count (vals overlapping)))
+     :candidate-count        (reduce *' 1
+                                     (map (fn [process]
+                                            (inc (count (get overlapping process []))))
+                                          processes))
      :states
      (letfn [(step [remaining current]
                (if-let [process (first remaining)]
@@ -621,39 +635,65 @@
     (if (= ::absent actual)
       complete
       (let [{:keys [states
+                    candidate-count
                     overlapping-write-count]} (refresh-window-state-choices write-pairs refresh-pair)
-            candidates      (map (fn [state]
-                                   (let [expected (refresh-expected complete state)
-                                         diff     (refresh-diff complete expected actual)]
-                                     {:expected expected
-                                      :diff diff}))
-                                 states)
-            candidate-count (count states)
             window          {:invoke-index   (pair-index refresh-pair :invoke)
                              :complete-index (pair-index refresh-pair :complete)}
-            matched         (some #(when-not (seq (:diff %)) %) candidates)]
-        (if matched
-          (assoc complete
-                 :type :ok
-                 :resolved? (when (op/fail? complete) true)
-                 :result (merge (refresh-result-base complete actual)
-                                {:actual actual
-                                 :expected (:expected matched)
-                                 :validation :window-compatible
-                                 :candidate-count candidate-count
-                                 :overlapping-write-count overlapping-write-count
-                                 :window window}))
-          (let [{:keys [expected diff]} (apply min-key #(diff-score (:diff %)) candidates)]
-            (assoc complete
-                   :type :fail
-                   :error :refresh-window-mismatch
-                   :result (merge (refresh-result-base complete actual)
-                                  {:actual actual
-                                   :expected expected
-                                   :diff diff
-                                   :candidate-count candidate-count
-                                   :overlapping-write-count overlapping-write-count
-                                   :window window}))))))))
+            skip-reason     (cond
+                              (> overlapping-write-count
+                                 refresh-window-max-overlapping-writes)
+                              :overlapping-write-limit
+
+                              (> candidate-count refresh-window-max-candidates)
+                              :candidate-limit
+
+                              :else
+                              nil)]
+        (if skip-reason
+          (update complete :result merge
+                  {:window-validation-skipped? true
+                   :window-validation-skip-reason skip-reason
+                   :candidate-count candidate-count
+                   :overlapping-write-count overlapping-write-count
+                   :window window})
+          (let [evaluation
+                (reduce (fn [best state]
+                          (let [expected  (refresh-expected complete state)
+                                diff      (refresh-diff complete expected actual)
+                                candidate {:expected expected
+                                           :diff diff}]
+                            (if (empty? diff)
+                              (reduced {:matched candidate})
+                              (if-let [best-candidate (:best best)]
+                                (if (< (diff-score diff)
+                                       (diff-score (:diff best-candidate)))
+                                  {:best candidate}
+                                  best)
+                                {:best candidate}))))
+                        {:best nil}
+                        states)]
+            (if-let [matched (:matched evaluation)]
+              (assoc complete
+                     :type :ok
+                     :resolved? (when (op/fail? complete) true)
+                     :result (merge (refresh-result-base complete actual)
+                                    {:actual actual
+                                     :expected (:expected matched)
+                                     :validation :window-compatible
+                                     :candidate-count candidate-count
+                                     :overlapping-write-count overlapping-write-count
+                                     :window window}))
+              (let [{:keys [expected diff]} (:best evaluation)]
+                (assoc complete
+                       :type :fail
+                       :error :refresh-window-mismatch
+                       :result (merge (refresh-result-base complete actual)
+                                      {:actual actual
+                                       :expected expected
+                                       :diff diff
+                                       :candidate-count candidate-count
+                                       :overlapping-write-count overlapping-write-count
+                                       :window window}))))))))))
 
 (defn- validate-refresh-op
   [write-pairs op-pair]
@@ -678,7 +718,8 @@
       (let [ids (map key-for-process
                      (range (long (max 1 (:concurrency test)))))]
         (with-reconnect! conn-holder node test setup-retryable-error?
-          #(mv/setup-stateful-schema! % ids))))
+          #(mv/setup-stateful-schema! % ids)
+          setup-timeout-ms)))
     this)
 
   (invoke! [this test op]

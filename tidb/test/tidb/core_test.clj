@@ -1,7 +1,9 @@
 (ns tidb.core-test
   (:require [clojure.test :refer :all]
             [jepsen.checker :as checker]
-            [tidb.core :as core]))
+            [tidb.core :as core]
+            [tidb.db :as db]
+            [tidb.nemesis :as nemesis]))
 
 (deftest maybe-gnuplot-checker-skips-when-unavailable
   (let [inner (reify checker/Checker
@@ -31,3 +33,25 @@
                             []
                             {})))
       (is @called?))))
+
+(deftest test-name-includes-run-tag-when-present
+  (with-redefs [core/workloads {:mv-stateful (fn [_]
+                                               {:generator nil
+                                                :client :fake-client
+                                                :checker nil})}
+                nemesis/nemesis (fn [_]
+                                  {:nemesis :fake-nemesis
+                                   :generator nil})
+                core/test-net (fn [_] :fake-net)
+                core/requires-real-network? (fn [_] false)
+                db/db (fn [] :fake-db)]
+    (is (= "TiDB nightly mv-stateful auto-retry auto-retry-limit :default txn-mode optimistic isolation :repeatable-read run-tag branch-validation-123 nemesis kill-db"
+           (:name (core/test {:version "nightly"
+                              :workload :mv-stateful
+                              :nemesis {:interval 10 :kill-db true}
+                              :time-limit 300
+                              :auto-retry :default
+                              :auto-retry-limit :default
+                              :txn-mode "optimistic"
+                              :isolation :repeatable-read
+                              :run-tag "branch-validation-123"}))))))

@@ -63,7 +63,7 @@ mview_warn_if_experimental() {
 }
 
 mview_catalog_helper() {
-  echo "$ROOT_DIR/mview_case_catalog.py"
+  echo "${MVIEW_CATALOG_HELPER:-$ROOT_DIR/mview_case_catalog.py}"
 }
 
 mview_emit_suite_cases() {
@@ -103,7 +103,7 @@ mview_init_suite_outputs() {
   mkdir -p "$MVIEW_SUITE_OUTPUT_DIR" "$MVIEW_CASE_LOG_DIR"
   touch "$MVIEW_RUNNER_LOG"
   if [[ ! -f "$MVIEW_STATUS_TSV" ]]; then
-    printf 'timestamp\tevent\tworkload\tnemesis\ttime_limit\texit_code\tstore_dirs\tcase_log\ttarball_url\tbinary_urls\n' > "$MVIEW_STATUS_TSV"
+    printf 'timestamp\tevent\tworkload\tnemesis\ttime_limit\trun_tag\texit_code\tstore_dirs\tcase_log\ttarball_url\tbinary_urls\n' > "$MVIEW_STATUS_TSV"
   fi
 }
 
@@ -121,21 +121,23 @@ mview_append_status() {
   local workload="$2"
   local nemesis="$3"
   local time_limit="$4"
-  local exit_code="${5:-}"
-  local store_dirs="${6:-}"
-  local case_log="${7:-}"
+  local run_tag="${5:-}"
+  local exit_code="${6:-}"
+  local store_dirs="${7:-}"
+  local case_log="${8:-}"
 
   mview_init_suite_outputs
   if [[ -z "${MVIEW_STATUS_TSV:-}" ]]; then
     return 0
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(mview_tsv_escape "$(mview_timestamp)")" \
     "$(mview_tsv_escape "$event")" \
     "$(mview_tsv_escape "$workload")" \
     "$(mview_tsv_escape "$nemesis")" \
     "$(mview_tsv_escape "$time_limit")" \
+    "$(mview_tsv_escape "$run_tag")" \
     "$(mview_tsv_escape "$exit_code")" \
     "$(mview_tsv_escape "$store_dirs")" \
     "$(mview_tsv_escape "$case_log")" \
@@ -149,14 +151,110 @@ mview_join_csv() {
   printf '%s' "$*"
 }
 
+mview_make_run_tag() {
+  local seed="${1:-case}"
+  printf '%s-%s-%s-%s\n' \
+    "$(mview_safe_name "$seed")" \
+    "$(date '+%Y%m%dT%H%M%S')" \
+    "$$" \
+    "$RANDOM"
+}
+
+mview_store_dirs_for_run_tag() {
+  local run_tag="$1"
+  python3 - "$run_tag" <<'PYSTORETAG'
+from pathlib import Path
+import sys
+
+run_tag = sys.argv[1]
+root = Path('store')
+if not root.exists():
+    raise SystemExit(0)
+
+paths = []
+needle = f" run-tag {run_tag}"
+for workload_dir in root.iterdir():
+    if workload_dir.name == 'suites':
+        continue
+    if workload_dir.is_symlink() or not workload_dir.is_dir():
+        continue
+    idx = workload_dir.name.find(needle)
+    if idx == -1:
+        continue
+    suffix_index = idx + len(needle)
+    if suffix_index < len(workload_dir.name) and workload_dir.name[suffix_index] != ' ':
+        continue
+    for run_dir in workload_dir.iterdir():
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        paths.append(str(run_dir.resolve()))
+
+for path in sorted(paths):
+    print(path)
+PYSTORETAG
+}
+
+mview_store_dir_for_run_tag() {
+  local run_tag="$1"
+  local store_dir=""
+  local count=0
+
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    store_dir="$candidate"
+    count=$((count + 1))
+  done < <(mview_store_dirs_for_run_tag "$run_tag")
+
+  if [[ "$count" -eq 1 ]]; then
+    printf '%s\n' "$store_dir"
+    return 0
+  fi
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "no store directories found for run tag: $run_tag" >&2
+  else
+    echo "multiple store directories found for run tag: $run_tag" >&2
+  fi
+  return 1
+}
+
+mview_collect_store_dirs_from_status() {
+  local status_tsv="$1"
+  python3 - "$status_tsv" <<'PYSTATUS'
+from pathlib import Path
+import csv
+import sys
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+
+seen = set()
+with path.open(newline='') as fh:
+    reader = csv.DictReader(fh, delimiter='\t')
+    for row in reader:
+        event = (row.get('event') or '').strip()
+        if event not in {'passed', 'failed'}:
+            continue
+        for store_dir in (row.get('store_dirs') or '').split(','):
+            store_dir = store_dir.strip()
+            if not store_dir or store_dir in seen:
+                continue
+            seen.add(store_dir)
+            print(store_dir)
+PYSTATUS
+}
+
 mview_run_suite_cases() {
   local suite="$1"
   local workload_filter="${2:-${WORKLOAD_FILTER:-}}"
+  local run_tag=""
   mview_init_suite_outputs
   mview_log_progress "suite cases start suite=$suite workload_filter=${workload_filter:-all}"
   while IFS=$'\t' read -r workload nemesis time_limit; do
     [[ -z "$workload" ]] && continue
-    mview_run_test "$workload" "$nemesis" "$time_limit"
+    run_tag="$(mview_make_run_tag "${suite}__${workload}__${nemesis}")"
+    mview_run_test "$workload" "$nemesis" "$time_limit" "$run_tag"
   done < <(mview_emit_suite_cases "$suite" "$workload_filter")
   mview_log_progress "suite cases done suite=$suite workload_filter=${workload_filter:-all}"
 }
@@ -165,13 +263,22 @@ mview_run_test() {
   local workload="$1"
   local nemesis="$2"
   local time_limit="$3"
-  local before_file=""
-  local after_file=""
+  local run_tag="${4:-${MVIEW_RUN_TAG:-}}"
   local case_log=""
   local store_dirs_csv=""
   local case_slug=""
+  local safe_run_tag=""
   local exit_code=0
   local -a store_dirs=()
+
+  if [[ -z "$run_tag" ]]; then
+    run_tag="$(mview_make_run_tag "${workload}__${nemesis}")"
+  fi
+
+  MVIEW_LAST_RUN_TAG="$run_tag"
+  MVIEW_LAST_STORE_DIRS_CSV=""
+  MVIEW_LAST_STORE_DIR=""
+
   local -a cmd=(
     lein run test
     --workload "$workload"
@@ -184,6 +291,7 @@ mview_run_test() {
     --txn-mode "$TXN_MODE"
     --tarball-url "$TARBALL_URL"
     --ssh-private-key "$SSH_PRIVATE_KEY"
+    --run-tag "$run_tag"
   )
 
   if [[ -n "${NODES:-}" ]]; then
@@ -196,16 +304,14 @@ mview_run_test() {
 
   mview_init_suite_outputs
   if [[ -n "${MVIEW_SUITE_OUTPUT_DIR:-}" ]]; then
-    before_file="$(mktemp)"
-    after_file="$(mktemp)"
-    mview_list_store_dirs > "$before_file"
     case_slug="$(mview_safe_name "${workload}__${nemesis}")"
-    case_log="$MVIEW_CASE_LOG_DIR/${case_slug}.log"
+    safe_run_tag="$(mview_safe_name "$run_tag")"
+    case_log="$MVIEW_CASE_LOG_DIR/${case_slug}__${safe_run_tag}.log"
     : > "$case_log"
   fi
 
-  mview_log_progress "case start workload=$workload nemesis=$nemesis time_limit=${time_limit}s tarball=${TARBALL_URL:-} binary_urls=${BINARY_URLS:-none}"
-  mview_append_status "start" "$workload" "$nemesis" "$time_limit" "" "" "$case_log"
+  mview_log_progress "case start workload=$workload nemesis=$nemesis time_limit=${time_limit}s run_tag=$run_tag tarball=${TARBALL_URL:-} binary_urls=${BINARY_URLS:-none}"
+  mview_append_status "start" "$workload" "$nemesis" "$time_limit" "$run_tag" "" "" "$case_log"
 
   if [[ -n "$case_log" ]]; then
     if "${cmd[@]}" 2>&1 | tee -a "$case_log"; then
@@ -221,27 +327,24 @@ mview_run_test() {
     fi
   fi
 
-  if [[ -n "$after_file" ]]; then
-    mview_list_store_dirs > "$after_file"
-    while IFS= read -r store_dir; do
-      [[ -z "$store_dir" ]] && continue
-      store_dirs+=("$store_dir")
-    done < <(mview_diff_store_dirs "$before_file" "$after_file")
-    if [[ ${#store_dirs[@]} -gt 0 ]]; then
-      store_dirs_csv="$(mview_join_csv "${store_dirs[@]}")"
-    fi
+  while IFS= read -r store_dir; do
+    [[ -z "$store_dir" ]] && continue
+    store_dirs+=("$store_dir")
+  done < <(mview_store_dirs_for_run_tag "$run_tag")
+
+  if [[ ${#store_dirs[@]} -gt 0 ]]; then
+    store_dirs_csv="$(mview_join_csv "${store_dirs[@]}")"
+    MVIEW_LAST_STORE_DIR="${store_dirs[0]}"
+    MVIEW_LAST_STORE_DIRS_CSV="$store_dirs_csv"
   fi
 
   if [[ "$exit_code" -eq 0 ]]; then
-    mview_log_progress "case passed workload=$workload nemesis=$nemesis store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
-    mview_append_status "passed" "$workload" "$nemesis" "$time_limit" "$exit_code" "$store_dirs_csv" "$case_log"
+    mview_log_progress "case passed workload=$workload nemesis=$nemesis run_tag=$run_tag store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
+    mview_append_status "passed" "$workload" "$nemesis" "$time_limit" "$run_tag" "$exit_code" "$store_dirs_csv" "$case_log"
   else
-    mview_log_progress "case failed workload=$workload nemesis=$nemesis exit_code=$exit_code store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
-    mview_append_status "failed" "$workload" "$nemesis" "$time_limit" "$exit_code" "$store_dirs_csv" "$case_log"
+    mview_log_progress "case failed workload=$workload nemesis=$nemesis run_tag=$run_tag exit_code=$exit_code store_dirs=${store_dirs_csv:-none} case_log=${case_log:-none}"
+    mview_append_status "failed" "$workload" "$nemesis" "$time_limit" "$run_tag" "$exit_code" "$store_dirs_csv" "$case_log"
   fi
-
-  [[ -n "$before_file" ]] && rm -f "$before_file"
-  [[ -n "$after_file" ]] && rm -f "$after_file"
 
   return "$exit_code"
 }
