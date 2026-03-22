@@ -96,6 +96,15 @@
      (finally
        (control/on-nodes ~test (partial os/teardown! (:os ~test))))))
 
+(defn- snarf-log-download-failure?
+  [e]
+  (and (instance? clojure.lang.ExceptionInfo e)
+       (contains? #{::control/download-failed
+                    ::control/no-session-available
+                    ::control/session-error
+                    ::control/ssh-failed}
+                  (:type (ex-data e)))))
+
 (defn snarf-logs!
   "Downloads logs for a test. Updates symlinks."
   [test]
@@ -115,12 +124,13 @@
             (doseq [[remote local] paths]
               (info "downloading" remote "to" local)
               (try
-                (control/download
-                  remote
-                  (.getCanonicalPath
-                    (store/path! test (name node)
-                                 ; strip leading /
-                                 (str/replace local #"^/" ""))))
+                (binding [control/*retries* 0]
+                  (control/download
+                    remote
+                    (.getCanonicalPath
+                      (store/path! test (name node)
+                                   ; strip leading /
+                                   (str/replace local #"^/" "")))))
                 (catch java.io.IOException e
                   (if (= "Pipe closed" (.getMessage e))
                     (info remote "pipe closed")
@@ -128,7 +138,12 @@
                 (catch java.lang.IllegalArgumentException e
                   ; This is a jsch bug where the file is just being
                   ; created
-                  (info remote "doesn't exist"))))))))
+                  (info remote "doesn't exist"))
+                (catch clojure.lang.ExceptionInfo e
+                  (if (snarf-log-download-failure? e)
+                    (warn e "Failed to download" remote "from" node
+                          "; continuing log collection")
+                    (throw e)))))))))
     (store/update-symlinks! test)))
 
 (defn maybe-snarf-logs!

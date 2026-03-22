@@ -741,10 +741,12 @@
   ([opts]
    (reify Checker
      (check [_ test history c-opts]
-       (let [o (merge opts c-opts)]
-         (perf/point-graph!     test history o)
-         (perf/quantiles-graph! test history o)
-         {:valid? true})))))
+       (if (perf/gnuplot-available?)
+         (let [o (merge opts c-opts)]
+           (perf/point-graph!     test history o)
+           (perf/quantiles-graph! test history o)
+           {:valid? true})
+         (perf/skip-result))))))
 
 (defn rate-graph
   "Spits out graphs of throughput over time. Checker options take precedence over
@@ -754,9 +756,11 @@
   ([opts]
    (reify Checker
      (check [_ test history c-opts]
-       (let [o (merge opts c-opts)]
-         (perf/rate-graph! test history o)
-         {:valid? true})))))
+       (if (perf/gnuplot-available?)
+         (let [o (merge opts c-opts)]
+           (perf/rate-graph! test history o)
+           {:valid? true})
+         (perf/skip-result))))))
 
 (defn perf
   "Composes various performance statistics. Checker options take precedence over
@@ -772,5 +776,7 @@
   []
   (reify Checker
     (check [_ test history opts]
-      (clock/plot! test history opts)
-      {:valid? true})))
+      (if (perf/gnuplot-available?)
+        (do (clock/plot! test history opts)
+            {:valid? true})
+        (perf/skip-result)))))

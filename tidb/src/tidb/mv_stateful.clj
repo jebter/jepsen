@@ -3,6 +3,7 @@
   (:require [clojure.java.jdbc :as j]
             [clojure.string :as str]
             [clojure.pprint :refer [pprint]]
+            [clojure.tools.logging :refer [info]]
             [jepsen
              [checker :as checker]
              [client :as client]
@@ -116,8 +117,19 @@
   (or (ambiguous-write-error? t)
       (instance? NullPointerException t)))
 
+(def reconnect-retry-count 4)
+(def reconnect-retry-base-ms 250)
+(def reconnect-retry-max-ms 1000)
+
 (def op-timeout-ms
   (+ c/socket-timeout 5000))
+
+(defn- reconnect-retry-delay-ms
+  [attempt]
+  (long
+   (min reconnect-retry-max-ms
+        (* reconnect-retry-base-ms
+           (bit-shift-left 1 (max 0 (dec attempt)))))))
 
 (defn setup-retryable-error?
   [t]
@@ -166,17 +178,23 @@
 
 (defn with-reconnect!
   [conn-holder node test retryable-error? f]
-  (loop [tries 3]
+  (loop [attempt 1]
     (let [result (try
                    (let [conn (ensure-conn! conn-holder node test)]
                      {:ok (run-with-op-timeout! conn-holder node #(f conn))})
                    (catch Throwable t
                      {:error t}))]
       (if-let [t (:error result)]
-        (if (and (pos? tries) (retryable-error? t))
-          (do
+        (if (and (retryable-error? t)
+                 (< attempt reconnect-retry-count))
+          (let [delay-ms (reconnect-retry-delay-ms attempt)]
+            (info {:reconnect/node       node
+                   :reconnect/attempt    attempt
+                   :reconnect/sleep-ms   delay-ms
+                   :reconnect/error      (or (.getMessage t) (str t))})
             (close-conn-holder! conn-holder)
-            (recur (dec tries)))
+            (Thread/sleep delay-ms)
+            (recur (inc attempt)))
           (throw t))
         (:ok result)))))
 
@@ -640,7 +658,8 @@
 (defn- validate-refresh-op
   [write-pairs op-pair]
   (let [complete (:complete op-pair)]
-    (if (contains? refresh-op-fns (:f complete))
+    (if (and (contains? refresh-op-fns (:f complete))
+             (op/fail? complete))
       (refresh-window-check op-pair write-pairs)
       complete)))
 

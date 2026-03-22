@@ -128,6 +128,44 @@
             "n5" "n5"}))
     (is (= @db-primaries ["n1"]))))
 
+(deftest snarf-logs-download-failure-is-best-effort-test
+  (let [downloads       (atom [])
+        retries-seen    (atom [])
+        update-symlinks (atom 0)
+        test            (assoc tst/noop-test
+                          :name       "snarf logs best effort"
+                          :start-time "20260322T131800.000+0800"
+                          :nodes      ["n1"]
+                          :db         (reify db/LogFiles
+                                        (log-files [_ _ _]
+                                          ["/opt/tidb/db.log"
+                                           "/opt/tidb/pd.log"])))]
+    (with-redefs [control/on-nodes
+                  (fn [test f]
+                    {"n1" (f test "n1")})
+                  control/download
+                  (fn [remote local]
+                    (swap! retries-seen conj control/*retries*)
+                    (swap! downloads conj [remote local])
+                    (throw (ex-info "download failed"
+                                    {:type :jepsen.control/download-failed})))
+                  store/path!
+                  (fn [_test & args]
+                    (java.io.File.
+                     (str "/tmp/"
+                          (str/join "/" (map str args)))))
+                  store/update-symlinks!
+                  (fn [_]
+                    (swap! update-symlinks inc))]
+      (is (= 1 (snarf-logs! test)))
+      (is (= [0 0] @retries-seen))
+      (is (= [["/opt/tidb/db.log"
+               "/private/tmp/n1/db.log"]
+              ["/opt/tidb/pd.log"
+               "/private/tmp/n1/pd.log"]]
+             @downloads))
+      (is (= 1 @update-symlinks)))))
+
 (deftest ^:integration worker-recovery-test
   ; Workers should only consume n ops even when failing.
   (let [invocations (atom 0)

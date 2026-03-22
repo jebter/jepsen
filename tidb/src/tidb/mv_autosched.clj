@@ -443,6 +443,58 @@
       (every? #{:unknown} states) :unknown
       :else false)))
 
+(defn- runtime-row
+  [snapshot-value component]
+  (some (fn [row]
+          (when (= component (:component row))
+            row))
+        (get-in snapshot-value [:runtime-metadata :rows])))
+
+(defn- runtime-progress-keys
+  [component]
+  (case component
+    :log-purge   [:next-time-ms :last-purged-tso]
+    :row-refresh [:next-time-ms :last-success-read-tso]
+    :agg-refresh [:next-time-ms :last-success-read-tso]
+    [:next-time-ms]))
+
+(defn- runtime-progress?
+  [snapshot-values component]
+  (let [rows      (keep #(runtime-row % component) snapshot-values)
+        key-paths (runtime-progress-keys component)]
+    (if (seq rows)
+      (let [first-state (select-keys (first rows) key-paths)]
+        (boolean
+         (some #(not= first-state (select-keys % key-paths))
+               (rest rows))))
+      :unknown)))
+
+(defn- history-entry
+  [snapshot-value component]
+  (some (fn [row]
+          (when (= component (:component row))
+            row))
+        (get-in snapshot-value [:runtime-metadata :recent-history])))
+
+(defn- history-progress-keys
+  [component]
+  (case component
+    :log-purge   [:job-id :status :end-time-ms :row-count]
+    :row-refresh [:job-id :status :end-time-ms :read-tso :row-count :failed-reason]
+    :agg-refresh [:job-id :status :end-time-ms :read-tso :row-count :failed-reason]
+    [:job-id :status]))
+
+(defn- history-progress?
+  [snapshot-values component]
+  (let [rows      (keep #(history-entry % component) snapshot-values)
+        key-paths (history-progress-keys component)]
+    (if (seq rows)
+      (let [first-state (select-keys (first rows) key-paths)]
+        (boolean
+         (some #(not= first-state (select-keys % key-paths))
+               (rest rows))))
+      :unknown)))
+
 (defrecord MVAutoschedClient [conn-holder node schema-created? schedule-meta]
   client/Client
 
@@ -500,12 +552,19 @@
             snapshot-failures    (filter op/fail? snapshot-ops)
             ok-snapshots         (ordered-snapshot-ops (filter op/ok? snapshot-ops))
             stable-pair          (stable-pair-present? ok-snapshots)
-            refresh-progress?    (some #(let [value (snapshot-result %)]
-                                          (and (:row-equal? value) (:agg-equal? value)))
-                                       ok-snapshots)
+            snapshot-values      (mapv snapshot-result ok-snapshots)
+            row-refresh-progress? (some :row-equal? snapshot-values)
+            agg-refresh-progress? (some :agg-equal? snapshot-values)
+            refresh-progress?    (and row-refresh-progress?
+                                      agg-refresh-progress?)
+            row-runtime-advanced? (runtime-progress? snapshot-values :row-refresh)
+            agg-runtime-advanced? (runtime-progress? snapshot-values :agg-refresh)
+            purge-runtime-advanced? (runtime-progress? snapshot-values :log-purge)
+            row-history-advanced? (history-progress? snapshot-values :row-refresh)
+            agg-history-advanced? (history-progress? snapshot-values :agg-refresh)
+            purge-history-advanced? (history-progress? snapshot-values :log-purge)
             purge-progress-state (purge-progress ok-snapshots)
             purge-progress-ok?   (not= false purge-progress-state)
-            snapshot-values      (mapv snapshot-result ok-snapshots)
             unresolved-write-count (count unresolved-writes)
             snapshot-valid?      (empty? snapshot-failures)
             quiet-stable?        (boolean stable-pair)
@@ -529,7 +588,15 @@
                        :snapshot-count            (count snapshot-ops)
                        :snapshot-fail-count       (count snapshot-failures)
                        :stable-after-quiet?       quiet-stable?
+                       :row-refresh-converged?    (boolean row-refresh-progress?)
+                       :agg-refresh-converged?    (boolean agg-refresh-progress?)
                        :post-fault-refresh?       refresh-converged?
+                       :row-refresh-runtime-advanced? row-runtime-advanced?
+                       :agg-refresh-runtime-advanced? agg-runtime-advanced?
+                       :purge-runtime-advanced?   purge-runtime-advanced?
+                       :row-refresh-history-advanced? row-history-advanced?
+                       :agg-refresh-history-advanced? agg-history-advanced?
+                       :purge-history-advanced?   purge-history-advanced?
                        :post-fault-purge          purge-progress-state
                        :snapshot-path             "mv-autosched/snapshots.edn"
                        :snapshot-json-path        "mv-autosched/snapshots.json"

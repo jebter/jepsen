@@ -402,7 +402,7 @@ Options:\n")
                           (info "Test options:\n"
                                 (with-out-str (pprint options)))
                           (let [cli-test    (test-fn options)
-                                stored-test (store/latest)
+                                stored-test (store/latest (:name cli-test))
                                 test (-> stored-test
                                          (dissoc :results)
                                          (merge cli-test)

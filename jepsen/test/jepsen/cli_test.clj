@@ -39,3 +39,29 @@
       (is (= 2 (:concurrency opts)))
       (is (= "/tmp/cli/jepsen.pem"
              (get-in opts [:ssh :private-key-path]))))))
+
+(deftest analyze-command-uses-name-scoped-latest-test
+  (let [latest-name    (atom nil)
+        analyzed-test  (atom nil)
+        cli-test       {:name "target-test"
+                        :start-time "20260322T160000.000+0800"
+                        :history [:cli-history]}
+        stored-test    {:name "target-test"
+                        :start-time "20260322T150000.000+0800"
+                        :history [:stored-history]
+                        :results {:valid? true}}
+        run-analyze!   (get-in (cli/single-test-cmd
+                                {:test-fn (fn [_] cli-test)})
+                               ["analyze" :run])]
+    (with-redefs [jepsen.store/latest (fn
+                                        ([] (throw (ex-info "unexpected zero-arity latest" {})))
+                                        ([test-name]
+                                         (reset! latest-name test-name)
+                                         stored-test))
+                  jepsen.core/analyze! (fn [test]
+                                         (reset! analyzed-test test)
+                                         test)]
+      (run-analyze! {:options {}})
+      (is (= "target-test" @latest-name))
+      (is (= [:stored-history] (:history @analyzed-test)))
+      (is (= "target-test" (:name @analyzed-test))))))

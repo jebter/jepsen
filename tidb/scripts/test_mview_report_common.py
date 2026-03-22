@@ -25,6 +25,7 @@ class MViewReportCommonTest(unittest.TestCase):
         )
 
         report = report_common.summarize_store(store)
+        self.assertTrue(report["reportable_store"])
         self.assertFalse(report["recognized_store"])
         with self.assertRaises(ValueError):
             report_common.require_recognized_store(report)
@@ -100,6 +101,43 @@ class MViewReportCommonTest(unittest.TestCase):
         self.assertEqual(0, summary["invalid_run_count"])
         self.assertEqual(1, summary["valid_run_count"])
         self.assertTrue(summary["runs"][0]["valid"])
+
+    def test_failed_store_without_workload_summaries_is_still_reportable(self):
+        store = self.root / "failed-before-summary"
+        (store / "node-0.example").mkdir(parents=True)
+        (store / "jepsen.log").write_text(
+            "\n".join(
+                [
+                    "2026-03-21 22:07:33,726 INFO tidb.db: node-0 TiDB install {:stage :plan, :tarball-url https://fileserver.example.invalid/tidb.tar.gz, :binary-override-count 1}",
+                    "2026-03-21 22:07:40,101 INFO tidb.db: node-0 TiDB install {:stage :binary-override-start, :url https://fileserver.example.invalid/tikv.tar.gz, :dest /opt/tidb/bin}",
+                ]
+            )
+            + "\n"
+        )
+        (store / "node-0.example" / "db.log").write_text(
+            '[2026/03/21 14:21:07.721 +00:00] [INFO] [printer.go:52] ["Welcome to TiDB."] '
+            '["Release Version"=v8.5.4] [Edition=Enterprise] '
+            '["Git Commit Hash"=3f274db0eddcbbe89ba32449bb49dac70cd7043d] '
+            '["Git Branch"=heads/refs/tags/v8.5.4] '
+            '["UTC Build Time"="2026-03-11 07:03:02"] '
+            '["Enterprise Extension Commit Hash"=7d43ff65ebc145bd63fa84cb368f8775be906998]\n'
+        )
+
+        report = report_common.summarize_store(store)
+        self.assertTrue(report["reportable_store"])
+        self.assertFalse(report["recognized_store"])
+        self.assertEqual(
+            "https://fileserver.example.invalid/tidb.tar.gz",
+            report["build_inputs"]["tarball_url"],
+        )
+        self.assertEqual(
+            ["https://fileserver.example.invalid/tikv.tar.gz"],
+            report["build_inputs"]["binary_urls"],
+        )
+        self.assertEqual(
+            "v8.5.4",
+            report["runtime"]["uniform_tidb_fingerprint"]["release_version"],
+        )
 
 
 if __name__ == "__main__":
