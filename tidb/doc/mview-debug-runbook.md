@@ -71,6 +71,7 @@ Rules:
 - sourcing `bridge.env.sh` is enough for raw `lein run test` as long as you do not override nodes or SSH key with conflicting flags
 - explicit `--nodes` and `--ssh-private-key` still override the bridge env and remain useful for debugging command construction
 - the `scripts/mview_run_and_report.sh` and suite wrappers also pick up the bridge node and SSH env automatically
+- for hosted automation that may reap background child processes after `create` returns, prefer `scripts/mview_testbed_bridge.sh exec ... -- <command...>` so the SQL tunnels stay alive in the same session as the Jepsen run
 
 Example:
 
@@ -78,6 +79,16 @@ Example:
 source /tmp/mview-testbed-XXXXXX/bridge.env.sh
 export JEPSEN_BEST_EFFORT_NET=1
 lein run test --workload mv-autosched --nemesis partition --time-limit 60 --test-count 1 --concurrency 10 --tarball-url <tarball-url> --binary-urls <binary-urls>
+```
+
+Automation-safe example:
+
+```bash
+scripts/mview_testbed_bridge.sh exec /tmp/mview-bridge-XXXXXX -- bash -lc '
+  cd /path/to/jepsen/tidb
+  export JEPSEN_BEST_EFFORT_NET=1
+  scripts/mview_run_and_report.sh mv-lifecycle <tarball-url> <binary-urls>
+'
 ```
 
 ## Always pin the build identity
@@ -155,6 +166,23 @@ If the environment cannot inject real network faults:
 
 - continue with `none`, `kill-*`, `stop-*`, `pause-*`, `shuffle-*`, and `random-merge` as appropriate
 - defer `partition` to a capable testbed
+
+## Fault capability requirements
+
+Do not treat missing container capabilities as a TiDB or workload regression.
+
+Rules:
+
+- `clock-skew` requires `SYS_TIME`; otherwise `/opt/jepsen/bump-time` fails with `settimeofday: Operation not permitted`
+- `partition` requires `NET_ADMIN`; otherwise iptables-based fault injection is not trustworthy
+- `scripts/mview_common.sh` defaults `JEPSEN_BEST_EFFORT_NET=1`, so `none` and other non-network faults can still run when real network shaping is unavailable
+- `tidb/jepsen-testbed.yaml` is the current bridge testbed template and requests both `SYS_TIME` and `NET_ADMIN` for direct debug runs
+
+When a run finishes but bridge cleanup cannot confirm namespace state because of cluster RBAC:
+
+- use `tcctl testbed get <testbed-name>` as the fallback verifier
+- if `tcctl` reports `namespace <name> not found`, treat cleanup as confirmed even when `kubectl get namespace` is forbidden
+- only keep it as an environment blocker when both kubectl verification and `tcctl testbed get` fail to confirm deletion
 
 ## Make suites observable
 

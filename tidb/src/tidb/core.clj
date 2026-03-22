@@ -3,6 +3,7 @@
   (:gen-class)
   (:refer-clojure :exclude [test])
   (:require [clojure.pprint :refer [pprint]]
+            [clojure.java.shell :as sh]
             [clojure.tools.logging :refer :all]
             [clojure.string :as str]
             [clojure.java.io :as io]
@@ -80,6 +81,24 @@
   (contains? #{"1" "true" "yes"}
              (some-> (System/getenv "JEPSEN_BEST_EFFORT_NET")
                      str/lower-case)))
+
+(def gnuplot-available?
+  (delay
+    (try
+      (zero? (:exit (sh/sh "gnuplot" "--version")))
+      (catch java.io.IOException _
+        false))))
+
+(defn maybe-gnuplot-checker
+  [label inner]
+  (if @gnuplot-available?
+    inner
+    (reify checker/Checker
+      (check [_ _ _ _]
+        (warn "Skipping" label "checker because gnuplot is unavailable")
+        {:valid? true
+         :skipped? true
+         :reason :gnuplot-unavailable}))))
 
 (defn test-net
   "Select the runtime network implementation for this test."
@@ -423,9 +442,11 @@
             :generator    gen
             :plot       plot-spec
             :checker    (checker/compose
-                         {:perf        (checker/perf)
+                         {:perf        (maybe-gnuplot-checker :perf
+                                                              (checker/perf))
                           :manifest    (manifest/checker*)
-                           :clock-skew  (checker/clock-plot)
+                          :clock-skew  (maybe-gnuplot-checker :clock-skew
+                                                              (checker/clock-plot))
                           :workload    (:checker workload)})})))
 
 (defn parse-nemesis-spec

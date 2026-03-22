@@ -96,6 +96,20 @@
      (finally
        (control/on-nodes ~test (partial os/teardown! (:os ~test))))))
 
+(defn- log-download-paths
+  "Returns a map of nodes to remote/local log path mappings for nodes that
+  actually have logs to download."
+  [test]
+  (->> (:nodes test)
+       (keep (fn [node]
+               (when-let [full-paths (seq (db/log-files (:db test) test node))]
+                 [node (->> full-paths
+                            (map #(str/split % #"/"))
+                            util/drop-common-proper-prefix
+                            (map (partial str/join "/"))
+                            (zipmap full-paths))])))
+       (into {})))
+
 (defn- snarf-log-download-failure?
   [e]
   (and (instance? clojure.lang.ExceptionInfo e)
@@ -111,39 +125,34 @@
   ; Download logs
   (locking snarf-logs!
     (when (satisfies? db/LogFiles (:db test))
-      (info "Snarfing log files")
-      (control/on-nodes test
-        (fn [test node]
-          (let [full-paths (db/log-files (:db test) test node)
-                ; A map of full paths to short paths
-                paths      (->> full-paths
-                                (map #(str/split % #"/"))
-                                util/drop-common-proper-prefix
-                                (map (partial str/join "/"))
-                                (zipmap full-paths))]
-            (doseq [[remote local] paths]
-              (info "downloading" remote "to" local)
-              (try
-                (binding [control/*retries* 0]
-                  (control/download
-                    remote
-                    (.getCanonicalPath
-                      (store/path! test (name node)
-                                   ; strip leading /
-                                   (str/replace local #"^/" "")))))
-                (catch java.io.IOException e
-                  (if (= "Pipe closed" (.getMessage e))
-                    (info remote "pipe closed")
-                    (throw e)))
-                (catch java.lang.IllegalArgumentException e
-                  ; This is a jsch bug where the file is just being
-                  ; created
-                  (info remote "doesn't exist"))
-                (catch clojure.lang.ExceptionInfo e
-                  (if (snarf-log-download-failure? e)
-                    (warn e "Failed to download" remote "from" node
-                          "; continuing log collection")
-                    (throw e)))))))))
+      (let [paths-by-node (log-download-paths test)]
+        (when (seq paths-by-node)
+          (info "Snarfing log files")
+          (control/on-nodes test (keys paths-by-node)
+            (fn [test node]
+              (doseq [[remote local] (get paths-by-node node)]
+                (info "downloading" remote "to" local)
+                (try
+                  (binding [control/*retries* 0]
+                    (control/download
+                      remote
+                      (.getCanonicalPath
+                        (store/path! test (name node)
+                                     ; strip leading /
+                                     (str/replace local #"^/" "")))))
+                  (catch java.io.IOException e
+                    (if (= "Pipe closed" (.getMessage e))
+                      (info remote "pipe closed")
+                      (throw e)))
+                  (catch java.lang.IllegalArgumentException e
+                    ; This is a jsch bug where the file is just being
+                    ; created
+                    (info remote "doesn't exist"))
+                  (catch clojure.lang.ExceptionInfo e
+                    (if (snarf-log-download-failure? e)
+                      (warn e "Failed to download" remote "from" node
+                            "; continuing log collection")
+                      (throw e))))))))))
     (store/update-symlinks! test)))
 
 (defn maybe-snarf-logs!

@@ -1,0 +1,29 @@
+---
+resourcePool: default
+generateName: jepsen-mv-debug-
+reclaimPolicy:
+  lease: 24h
+  gcStrategy:
+    onCompletion:
+      reserveEnv:
+        durationOnWorkingHour: 1h
+        scaleIn: false
+        scaleDown: false
+items:
+  - name: node
+    type: WORKLOAD_NODE
+    spec:
+      replicas: 5
+      container:
+        name: ssh
+        image: hub.pingcap.net/qa/jepsen-node-base:20220222
+        securityContext:
+          capabilities:
+            add: [ "SYS_TIME", "NET_ADMIN" ]
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: "16"
+            memory: 32Gi

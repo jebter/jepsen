@@ -1341,6 +1341,23 @@
     (is (contains? anomaly-kinds :no-post-reset-convergence))
     (is (contains? anomaly-kinds :no-post-reset-stability))))
 
+(deftest autosched-time-check-classifies-clock-skew-capability-gaps
+  (let [history [{:type :info
+                  :f :bump-clock
+                  :value {"n1" 3.0}
+                  :error "indeterminate: Command exited with non-zero status 2 on node n1:\nsettimeofday: Operation not permitted"}
+                 (time-snapshot-op 0 "n1" true true 1 1 1)]
+        summary (checker/check (autosched-time/checker*)
+                               {:nemesis-spec {:clock-skew true}}
+                               history
+                               nil)
+        anomaly-kinds (set (map :kind (:anomalies summary)))]
+    (is (false? (:clock-skew-supported? summary)))
+    (is (contains? anomaly-kinds :clock-skew-unsupported))
+    (is (= :bump-clock (get-in summary [:first-clock-failure :f])))
+    (is (re-find #"Operation not permitted"
+                 (:clock-skew-support-error summary)))))
+
 (deftest final-generator-reset-clock-targets-all-test-nodes
   (let [generator (nemesis/final-generator {:clock-skew true})
         test      {:nodes ["n1" "n2" "n3"]

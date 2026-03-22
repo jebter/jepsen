@@ -12,6 +12,7 @@ usage() {
   cat <<'EOF'
 usage:
   scripts/mview_testbed_bridge.sh create [workdir] [spec]
+  scripts/mview_testbed_bridge.sh exec <workdir> [spec] -- <command...>
   scripts/mview_testbed_bridge.sh cleanup <workdir>
 
 create:
@@ -25,6 +26,13 @@ cleanup:
   SQL port-forwards recorded under that same workdir. It tries
   "tcctl testbed delete -f output" first. If the namespace is still present
   afterwards, it falls back to deleting that namespace via kubectl.
+
+exec:
+  Creates a fresh tcctl testbed, exports the generated bridge env in the same
+  shell process, runs <command...>, and then cleans up that same testbed. Use
+  this when the caller may reap background child processes after create
+  returns; the SQL port-forwards stay alive because the command runs in the
+  same session that created them.
 EOF
 }
 
@@ -357,6 +365,31 @@ testbed_state_in_tcctl_list() {
   printf 'absent'
 }
 
+namespace_query_forbidden() {
+  local output="${1:-}"
+  grep -qi 'cannot get resource "namespaces"' <<<"$output"
+}
+
+tcctl_get_testbed_raw() {
+  local testbed="$1"
+  set +e
+  tcctl testbed get "$testbed" 2>&1
+  local rc=$?
+  set -e
+  return "$rc"
+}
+
+tcctl_testbed_missing() {
+  local output="${1:-}"
+  grep -qiE '^Error: namespace .+ not found$' <<<"$output"
+}
+
+sanitize_tcctl_output() {
+  local output="${1:-}"
+  printf '%s\n' "$output" | sed -E \
+    '/^[A-Z][0-9]{4} .*testbed_list\.go:96\] list testbed of [^ ]+ failed: list testbeds error: .* not found$/d'
+}
+
 create_tcctl_testbed() {
   local workdir="$1"
   local spec="$2"
@@ -522,9 +555,12 @@ cleanup_testbed() {
   local kubeconfig=""
   local testbed=""
   local delete_output=""
+  local delete_output_display=""
   local delete_rc=0
   local phase=""
   local wait_result=""
+  local tcctl_get_output=""
+  local tcctl_get_output_display=""
   local cleanup_cmd="tcctl testbed delete -f output"
 
   if [[ -z "$workdir" ]]; then
@@ -546,10 +582,7 @@ cleanup_testbed() {
   delete_output="$(cd "$workdir" && tcctl testbed delete -f output 2>&1)"
   delete_rc=$?
   set -e
-
-  if [[ -n "$delete_output" ]]; then
-    printf '%s\n' "$delete_output" >&2
-  fi
+  delete_output_display="$(sanitize_tcctl_output "$delete_output")"
 
   if namespace_exists "$kubeconfig" "$testbed"; then
     KUBECONFIG="$kubeconfig" kubectl delete namespace "$testbed" --wait=false >/dev/null
@@ -561,18 +594,121 @@ cleanup_testbed() {
 
   if ! wait_result="$(wait_for_namespace_gone "$kubeconfig" "$testbed" "$CLEANUP_WAIT_SECONDS")"; then
     phase="$(namespace_phase "$kubeconfig" "$testbed")"
+    set +e
+    tcctl_get_output="$(tcctl_get_testbed_raw "$testbed")"
+    set -e
+    tcctl_get_output_display="$(sanitize_tcctl_output "$tcctl_get_output")"
+    if tcctl_testbed_missing "$tcctl_get_output"; then
+      echo "cleanup confirmed for testbed $testbed via tcctl" >&2
+      echo "cleanup command: $cleanup_cmd" >&2
+      if namespace_query_forbidden "$wait_result"; then
+        echo "namespace verification via kubectl is blocked by RBAC; tcctl reports namespace not found" >&2
+      elif [[ "$wait_result" == timeout:* ]]; then
+        echo "namespace stayed Terminating during kubectl wait, but tcctl now reports namespace not found" >&2
+      fi
+      return 0
+    fi
+    if ((delete_rc == 0)) && namespace_query_forbidden "$wait_result"; then
+      echo "cleanup verification blocked for testbed $testbed" >&2
+      echo "cleanup command: $cleanup_cmd" >&2
+      echo "delete request completed, but namespace verification is blocked by RBAC" >&2
+      if [[ -n "$phase" ]]; then
+        echo "namespace phase: $phase" >&2
+      fi
+      echo "blocker: $wait_result" >&2
+      return 1
+    fi
     echo "cleanup blocked for testbed $testbed" >&2
     echo "cleanup command: $cleanup_cmd" >&2
+    if [[ -n "$delete_output_display" ]]; then
+      echo "tcctl delete: $delete_output_display" >&2
+    fi
     if [[ -n "$phase" ]]; then
       echo "namespace phase: $phase" >&2
     fi
     echo "blocker: $wait_result" >&2
+    if [[ -n "$tcctl_get_output_display" ]]; then
+      echo "tcctl get: $tcctl_get_output_display" >&2
+    fi
     return 1
   fi
 
   if ((delete_rc != 0)); then
     return 0
   fi
+}
+
+bridge_exec_trap() {
+  local workdir="$1"
+  local command_rc="${2:-$?}"
+  local cleanup_rc=0
+
+  trap - EXIT INT TERM
+
+  set +e
+  cleanup_testbed "$workdir"
+  cleanup_rc=$?
+  set -e
+
+  if ((cleanup_rc != 0)); then
+    exit "$cleanup_rc"
+  fi
+
+  exit "$command_rc"
+}
+
+bridge_exec() {
+  local workdir="${1:-}"
+  local spec="$DEFAULT_SPEC"
+  local bridge_env=""
+  local command_rc=0
+
+  shift || true
+
+  if [[ -z "$workdir" ]]; then
+    echo "exec requires <workdir>" >&2
+    exit 1
+  fi
+
+  if [[ $# -gt 0 && "$1" != "--" ]]; then
+    spec="$1"
+    shift
+  fi
+
+  if [[ $# -eq 0 || "$1" != "--" ]]; then
+    echo "exec requires -- <command...>" >&2
+    exit 1
+  fi
+
+  shift
+
+  if [[ $# -eq 0 ]]; then
+    echo "exec requires a command to run" >&2
+    exit 1
+  fi
+
+  create_testbed "$workdir" "$spec"
+
+  bridge_env="$workdir/bridge.env.sh"
+  if [[ ! -f "$bridge_env" ]]; then
+    echo "missing bridge env after create: $bridge_env" >&2
+    exit 1
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$bridge_env"
+  set +a
+
+  echo "running command with bridge env from $bridge_env" >&2
+  trap "bridge_exec_trap '$workdir'" EXIT INT TERM
+
+  set +e
+  "$@"
+  command_rc=$?
+  set -e
+
+  bridge_exec_trap "$workdir" "$command_rc"
 }
 
 main() {
@@ -585,6 +721,10 @@ main() {
     create)
       shift
       create_testbed "${1:-}" "${2:-$DEFAULT_SPEC}"
+      ;;
+    exec)
+      shift
+      bridge_exec "$@"
       ;;
     cleanup)
       shift
