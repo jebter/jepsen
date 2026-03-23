@@ -23,7 +23,9 @@
                  [slingshot "0.12.2"]
                  [org.clojure/data.codec "0.1.1"]
                  [fipp "0.6.13"]
-                 [io.lacuna/bifurcan "0.1.0"]]
+                 [io.lacuna/bifurcan "0.1.0"]
+                 [javax.xml.bind/jaxb-api "2.3.1"]
+                 [org.glassfish.jaxb/jaxb-runtime "2.3.1"]]
   :main jepsen.cli
   :plugins [[lein-localrepo "0.5.4"]
             [lein-codox "0.10.3"]]

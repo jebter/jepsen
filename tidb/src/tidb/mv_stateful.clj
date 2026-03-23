@@ -20,7 +20,7 @@
 (def write-fns [:insert :update-value :update-value :move-group :delete])
 (def write-op-fns #{:insert :update-value :move-group :delete})
 (def refresh-op-fns #{:refresh-row :refresh-agg})
-(def ^:dynamic refresh-window-max-candidates 10000)
+(def ^:dynamic refresh-window-max-candidates 1024)
 (def ^:dynamic refresh-window-max-overlapping-writes 8)
 
 (defn process-id
@@ -505,40 +505,52 @@
   [write-pairs refresh-pair]
   (let [invoke-index   (pair-index refresh-pair :invoke)
         complete-index (pair-index refresh-pair :complete)
-        before         (->> write-pairs
-                            (filter #(< (pair-index % :complete) invoke-index))
-                            (sort-by #(pair-index % :complete))
-                            (reduce (fn [state pair]
-                                      (assoc state
-                                             (write-process pair)
-                                             (write-value pair)))
-                                    {}))
-        overlapping    (->> write-pairs
-                            (remove #(< (pair-index % :complete) invoke-index))
-                            (remove #(> (pair-index % :invoke) complete-index))
-                            (sort-by #(pair-index % :invoke))
-                            (group-by write-process))
-        processes      (sort (distinct (concat (keys before)
+        before-by-process
+        (->> write-pairs
+             (filter #(< (pair-index % :complete) invoke-index))
+             (sort-by #(pair-index % :complete))
+             (reduce (fn [state pair]
+                       (assoc state
+                              (write-process pair)
+                              (write-value pair)))
+                     {}))
+        overlapping
+        (->> write-pairs
+             (remove #(< (pair-index % :complete) invoke-index))
+             (remove #(> (pair-index % :invoke) complete-index))
+             (sort-by #(pair-index % :invoke))
+             (group-by write-process)
+             (into {}
+                   (map (fn [[process pairs]]
+                          [process (mapv write-value pairs)]))))
+        processes      (sort (distinct (concat (keys before-by-process)
                                                (keys overlapping))))]
-    {:overlapping-write-count (reduce + 0 (map count (vals overlapping)))
+    {:base-state              (->> before-by-process
+                                   vals
+                                   (reduce (fn [state value]
+                                             (assoc state (:id value) value))
+                                           {}))
+     :overlapping            overlapping
+     :processes              processes
+     :overlapping-write-count (reduce + 0 (map count (vals overlapping)))
      :candidate-count        (reduce *' 1
                                      (map (fn [process]
                                             (inc (count (get overlapping process []))))
-                                          processes))
-     :states
-     (letfn [(step [remaining current]
-               (if-let [process (first remaining)]
-                 (let [base-choice  (get before process)
-                       next-choices (cons base-choice
-                                          (map write-value (get overlapping process [])))]
-                   (mapcat (fn [choice]
-                             (step (rest remaining)
-                                   (if choice
-                                     (assoc current (:id choice) choice)
-                                     current)))
-                           next-choices))
-                 [current]))]
-       (step processes {}))}))
+                                          processes))}))
+
+(defn- refresh-window-states
+  [{:keys [base-state overlapping processes]}]
+  (letfn [(step [remaining current]
+            (lazy-seq
+             (if-let [process (first remaining)]
+               (mapcat (fn [choice]
+                         (step (rest remaining)
+                               (if choice
+                                 (assoc current (:id choice) choice)
+                                 current)))
+                       (cons nil (get overlapping process [])))
+               [current])))]
+    (step processes base-state)))
 
 (defn- diff-score
   [diff]
@@ -632,11 +644,11 @@
   [refresh-pair write-pairs]
   (let [complete (:complete refresh-pair)
         actual   (refresh-actual complete)]
-    (if (= ::absent actual)
+      (if (= ::absent actual)
       complete
-      (let [{:keys [states
-                    candidate-count
-                    overlapping-write-count]} (refresh-window-state-choices write-pairs refresh-pair)
+      (let [{:keys [candidate-count
+                    overlapping-write-count]
+             :as state-choices} (refresh-window-state-choices write-pairs refresh-pair)
             window          {:invoke-index   (pair-index refresh-pair :invoke)
                              :complete-index (pair-index refresh-pair :complete)}
             skip-reason     (cond
@@ -671,7 +683,7 @@
                                   best)
                                 {:best candidate}))))
                         {:best nil}
-                        states)]
+                        (refresh-window-states state-choices))]
             (if-let [matched (:matched evaluation)]
               (assoc complete
                      :type :ok
