@@ -1522,6 +1522,30 @@
       (is (= 2 (get-in validated [:result :candidate-count])))
       (is (= 1 (get-in validated [:result :overlapping-write-count]))))))
 
+(deftest stateful-refresh-window-validation-skips-before-enumerating-candidates
+  (binding [stateful/refresh-window-max-candidates 1]
+    (with-redefs [tidb.mv-stateful/refresh-window-states
+                  (fn [_]
+                    (throw (ex-info "skip path should not enumerate candidates" {})))]
+      (let [history (vec
+                     (concat
+                      (lifecycle-write-events
+                       1 2 1 :update-value
+                       {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5" :deleted false :pad "pad-v5"})
+                      (stateful-refresh-events
+                       3 6 :refresh-row 2 :fail
+                       {:id 2
+                        :diff {:expected {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6"}
+                               :actual   {:id 2 :g1 2 :v1 200005 :version 5 :last-token "tok-v5"}}})
+                      (lifecycle-write-events
+                       4 5 1 :update-value
+                       {:id 2 :g1 2 :v1 200006 :version 6 :last-token "tok-v6" :deleted false :pad "pad-v6"})))
+            validated (validate-stateful-refresh-history history)]
+        (is (= :fail (:type validated)))
+        (is (true? (get-in validated [:result :window-validation-skipped?])))
+        (is (= :candidate-limit
+               (get-in validated [:result :window-validation-skip-reason])))))))
+
 (deftest stateful-refresh-window-validation-skips-wide-overlapping-window
   (binding [stateful/refresh-window-max-overlapping-writes 0]
     (let [history (vec
