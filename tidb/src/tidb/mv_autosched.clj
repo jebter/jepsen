@@ -495,6 +495,82 @@
                (rest rows))))
       :unknown)))
 
+(def runtime-components
+  [:row-refresh :agg-refresh :log-purge])
+
+(defn- distinct-selected-state-count
+  [rows key-paths]
+  (let [states (->> rows
+                    (map #(select-keys % key-paths))
+                    (remove empty?)
+                    distinct
+                    seq)]
+    (when states
+      (count states))))
+
+(defn- component-recovery-summary
+  [snapshot-values component runtime-advanced? history-advanced?]
+  (let [runtime-rows          (keep #(runtime-row % component) snapshot-values)
+        history-rows          (keep #(history-entry % component) snapshot-values)
+        runtime-key-paths     (runtime-progress-keys component)
+        history-key-paths     (history-progress-keys component)
+        last-snapshot-at-ms   (:snapshot-at-ms (last snapshot-values))
+        last-runtime          (last runtime-rows)
+        last-history          (last history-rows)
+        next-time-ms          (:next-time-ms last-runtime)
+        last-history-end-time (:end-time-ms last-history)]
+    (cond-> {:runtime-advanced?        runtime-advanced?
+             :history-advanced?        history-advanced?
+             :runtime-state-count      (distinct-selected-state-count runtime-rows runtime-key-paths)
+             :history-state-count      (distinct-selected-state-count history-rows history-key-paths)
+             :stalled-after-quiet?     (and (= false runtime-advanced?)
+                                           (= false history-advanced?))}
+      last-runtime
+      (assoc :last-runtime-state (select-keys last-runtime runtime-key-paths))
+
+      (and last-snapshot-at-ms next-time-ms)
+      (assoc :next-time-overdue-ms (- last-snapshot-at-ms next-time-ms))
+
+      last-history
+      (assoc :last-history-state (select-keys last-history history-key-paths))
+
+      (and last-snapshot-at-ms last-history-end-time)
+      (assoc :last-history-age-ms (- last-snapshot-at-ms last-history-end-time)))))
+
+(defn- recovery-diagnosis
+  [snapshot-values]
+  (let [component-summaries      (into (sorted-map)
+                                       (keep (fn [component]
+                                               (let [runtime-advanced? (runtime-progress? snapshot-values component)
+                                                     history-advanced? (history-progress? snapshot-values component)
+                                                     summary           (component-recovery-summary
+                                                                        snapshot-values
+                                                                        component
+                                                                        runtime-advanced?
+                                                                        history-advanced?)]
+                                                 (when (or (not= :unknown runtime-advanced?)
+                                                           (not= :unknown history-advanced?)
+                                                           (:last-runtime-state summary)
+                                                           (:last-history-state summary))
+                                                   [component summary]))))
+                                       runtime-components)
+        stalled-components       (->> component-summaries
+                                      (keep (fn [[component summary]]
+                                              (when (:stalled-after-quiet? summary)
+                                                component)))
+                                      vec)
+        tracked-components       (keys component-summaries)
+        refresh-components       [:row-refresh :agg-refresh]
+        refresh-stall-suspected? (every? #(true? (get-in component-summaries
+                                                         [% :stalled-after-quiet?]))
+                                         refresh-components)]
+    {:component-recovery-summary        component-summaries
+     :stalled-components-after-quiet    stalled-components
+     :all-components-stalled-after-quiet? (and (seq tracked-components)
+                                               (= (count tracked-components)
+                                                  (count stalled-components)))
+     :refresh-stall-suspected?          refresh-stall-suspected?}))
+
 (defrecord MVAutoschedClient [conn-holder node schema-created? schedule-meta]
   client/Client
 
@@ -569,6 +645,7 @@
             snapshot-valid?      (empty? snapshot-failures)
             quiet-stable?        (boolean stable-pair)
             refresh-converged?   (boolean refresh-progress?)
+            recovery-diagnosis   (recovery-diagnosis snapshot-values)
             write-resolution-valid? (zero? unresolved-write-count)
             autosched-converged? (and snapshot-valid?
                                       quiet-stable?
@@ -597,6 +674,10 @@
                        :row-refresh-history-advanced? row-history-advanced?
                        :agg-refresh-history-advanced? agg-history-advanced?
                        :purge-history-advanced?   purge-history-advanced?
+                       :component-recovery-summary (:component-recovery-summary recovery-diagnosis)
+                       :stalled-components-after-quiet (:stalled-components-after-quiet recovery-diagnosis)
+                       :all-components-stalled-after-quiet? (:all-components-stalled-after-quiet? recovery-diagnosis)
+                       :refresh-stall-suspected? (:refresh-stall-suspected? recovery-diagnosis)
                        :post-fault-purge          purge-progress-state
                        :snapshot-path             "mv-autosched/snapshots.edn"
                        :snapshot-json-path        "mv-autosched/snapshots.json"
