@@ -81,6 +81,11 @@ Current checker contract:
 - if the MLog backing table is not discoverable in SQL metadata, purge evidence is reported as `unknown` rather than failing the whole test only because telemetry is unavailable
 - unresolved write ambiguity is still surfaced via `strict-valid?` and `first-unresolved-write`, but it does not fail an otherwise converged autosched run by itself
 
+Execution baseline:
+
+- treat `900` seconds as the default smoke and branch-validation baseline for `mv-autosched`
+- shorter local runs are useful for SQL-surface or bridge triage, but they are not strong enough to decide whether the autosched baseline is gate-ready because purge convergence can legitimately need multiple scheduled cycles during quiet phase
+
 ### `mv-autosched-time`
 
 Use `mv-autosched-time` as the phase-2 skeleton for schedule-time anomalies.
@@ -99,6 +104,7 @@ Current checker contract:
 Current limitation:
 
 - `clock-skew` is enabled for manual runs, but it is not yet part of the default gate suite
+- `manual_only` is an intentional suite-policy state for this experimental workload, not a claim that every direct manual run is currently red
 - the checker treats `mysql.tidb_mview_refresh_info` / `mysql.tidb_mlog_purge_info` as the primary schedule signal, but it still keeps compatibility fallbacks for older builds that only expose legacy timer metadata
 
 ## Branch-build input model

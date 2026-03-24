@@ -54,11 +54,19 @@ Use this order unless a user explicitly asks for something narrower.
 5. Run the workload's full 14-case single-fault batch only after the baseline and representative faults are stable.
 6. Treat `partition` as valid only when the testbed really supports network fault injection.
 
+Time-limit guardrails:
+
+- use the catalog `time_limit` when deciding whether a workload baseline is really gate-ready
+- `mv-stateful` and `mv-lifecycle` baseline smoke runs use `300` seconds
+- `mv-autosched` baseline smoke runs use `900` seconds; shorter ad-hoc runs are triage-only because the checker needs enough quiet-phase time to observe scheduled refresh and purge convergence
+- `mv-autosched-time` stays on the manual path even if a direct manual run passes, because promotion is a suite-policy decision rather than a one-off green-run signal
+
 Examples:
 
 ```bash
 lein run test --workload mv-stateful --nemesis none --time-limit 300 --test-count 1 --concurrency 2n --tarball-url <tarball-url> --binary-urls <binary-urls>
 lein run test --workload mv-lifecycle --nemesis none --time-limit 300 --test-count 1 --concurrency 2n --tarball-url <tarball-url> --binary-urls <binary-urls>
+lein run test --workload mv-autosched --nemesis none --time-limit 900 --test-count 1 --concurrency 2n --tarball-url <tarball-url> --binary-urls <binary-urls>
 WORKLOAD_FILTER=mv-lifecycle scripts/mview_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
 MAX_PARALLEL=3 WORKLOAD_FILTER=mv-lifecycle scripts/mview_parallel_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
 ```
