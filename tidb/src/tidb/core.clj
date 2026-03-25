@@ -67,6 +67,10 @@
    :sequential      sequential/workload
    :table           table/workload})
 
+(def default-binary-urls
+  ["tidb:https://fileserver.pingcap.net/download/builds/hotfix/tidb/v8.5.4-20260320-7c92abd/10060/tidb-patch-linux-amd64.tar.gz"
+   "tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz"])
+
 (def network-nemesis-keys
   "Nemesis types which require a real network implementation."
   #{:partition
@@ -548,7 +552,7 @@
     :default "v3.0.0-beta.1"]
 
    [nil "--binary-urls URLS" "URLs to binary tarballs which overwrite the default tarball installation."
-    :default nil
+    :default default-binary-urls
     :parse-fn (fn [s]
                 (->> (str/split s #",")
                      (map str/trim)

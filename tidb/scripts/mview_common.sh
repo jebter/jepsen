@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 
+mview_default_binary_urls() {
+  printf '%s' "tidb:https://fileserver.pingcap.net/download/builds/hotfix/tidb/v8.5.4-20260320-7c92abd/10060/tidb-patch-linux-amd64.tar.gz,tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz"
+}
+
+mview_init_binary_urls() {
+  if [[ -z "${BINARY_URLS:-}" ]]; then
+    BINARY_URLS="$(mview_default_binary_urls)"
+  fi
+  export BINARY_URLS
+}
+
 mview_init_root() {
   local script_dir="$1"
   ROOT_DIR="$(cd "$script_dir/.." && pwd)"
@@ -18,6 +29,7 @@ mview_init_base_env() {
   SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-${JEPSEN_SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}}"
   JEPSEN_BEST_EFFORT_NET="${JEPSEN_BEST_EFFORT_NET:-1}"
   TXN_MODE="${TXN_MODE:-optimistic}"
+  mview_init_binary_urls
   export JEPSEN_BEST_EFFORT_NET
 }
 

@@ -79,7 +79,7 @@
                                                   :retries-left tries
                                                   :exit (:exit e)})
                           ::retry)
-                      (throw e))))]
+                      (throw+ e))))]
         (if (= ::retry res)
           (recur (dec tries) (inc attempt))
           res)))))

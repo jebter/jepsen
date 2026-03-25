@@ -703,6 +703,59 @@
         (is (= new-conn @conn-holder))
         (is (= (str :n1) (get-in result [:result :snapshot-node])))))))
 
+(deftest autosched-snapshot-state-records-db-identity
+  (let [conn          {::c/node :n1
+                       :subname "//127.0.0.1:24001/test"}
+        schedule-meta {:log-table "$mlog$mv_stateful_base"
+                       :row-refresh-stmt "row-refresh"
+                       :agg-refresh-stmt "agg-refresh"
+                       :purge-schedule-stmt "purge"
+                       :mlog-stmt "mlog"}]
+    (with-redefs [autosched/query-db-now-ms          (constantly 1700000001234)
+                  autosched/query-db-identity        (constantly {:connection-id 42
+                                                                  :hostname "tidb-node-1"
+                                                                  :port 4000})
+                  mv/query-base-row-projection       (constantly (sorted-map))
+                  mv/query-mv-row-projection         (constantly (sorted-map))
+                  mv/query-base-agg                  (constantly (sorted-map))
+                  mv/query-mv-agg                    (constantly (sorted-map))
+                  mv/count-table-rows                (constantly 7)
+                  mv/read-schedule-metadata          (constantly {:available? true})
+                  mv/read-runtime-metadata           (constantly {:available? true :rows []})]
+      (let [snapshot (autosched/snapshot-state :n1 conn schedule-meta)]
+        (is (= (str :n1) (:snapshot-node snapshot)))
+        (is (= 1700000001234 (:db-now-ms snapshot)))
+        (is (= {:connection-node ":n1"
+                :connection-target "//127.0.0.1:24001/test"
+                :connection-id 42
+                :hostname "tidb-node-1"
+                :port 4000}
+               (:db-identity snapshot)))
+        (is (= (- 1700000001234 (:snapshot-at-ms snapshot))
+               (:db-client-offset-ms snapshot)))
+        (is (true? (:row-equal? snapshot)))
+        (is (true? (:agg-equal? snapshot)))
+        (is (= 7 (:log-row-count snapshot)))))))
+
+(deftest autosched-snapshot-state-keeps-routing-info-without-db-identity
+  (let [conn          {::c/node :n2
+                       :subname "//node-2.node-peer.testbed:4000/test"}
+        schedule-meta {:log-table nil}]
+    (with-redefs [autosched/query-db-now-ms          (constantly 1700000004321)
+                  autosched/query-db-identity        (constantly nil)
+                  mv/query-base-row-projection       (constantly (sorted-map))
+                  mv/query-mv-row-projection         (constantly (sorted-map))
+                  mv/query-base-agg                  (constantly (sorted-map))
+                  mv/query-mv-agg                    (constantly (sorted-map))
+                  mv/read-schedule-metadata          (constantly {:available? true})
+                  mv/read-runtime-metadata           (constantly {:available? true :rows []})]
+      (let [snapshot (autosched/snapshot-state :n2 conn schedule-meta)]
+        (is (= {:connection-node ":n2"
+                :connection-target "//node-2.node-peer.testbed:4000/test"}
+               (:db-identity snapshot)))
+        (is (= 1700000004321 (:db-now-ms snapshot)))
+        (is (nil? (:log-row-count snapshot)))))))
+
 (deftest stable-pair-present-is-node-local
   (testing "cross-node adjacent equal snapshots do not count as stable"
     (is (false?
@@ -874,6 +927,33 @@
       (is (= row (mv/schedule-refresh! ::conn mv/row-view 2 5)))
       (is (= purge (mv/schedule-purge! ::conn 2 11)))
       (is (= [mlog row purge] @calls)))))
+
+(deftest stateful-setup-ddl-uses-extended-timeout
+  (let [calls (atom [])]
+    (with-redefs [c/execute! (fn [_ [stmt] opts]
+                               (swap! calls conj {:stmt stmt :opts opts})
+                               nil)]
+      (mv/drop-artifacts! ::conn)
+      (mv/create-base-table! ::conn)
+      (mv/split-base-table! ::conn [1 2 3 4])
+      (mv/create-mlog! ::conn)
+      (mv/create-row-view! ::conn)
+      (mv/create-agg-view! ::conn))
+    (is (= 9 (count @calls)))
+    (is (every? #(= {:timeout mv/setup-ddl-timeout-sec} (:opts %)) @calls))))
+
+(deftest scheduled-setup-ddl-uses-extended-timeout
+  (let [calls (atom [])]
+    (with-redefs [c/execute! (fn [_ [stmt] opts]
+                               (swap! calls conj {:stmt stmt :opts opts})
+                               nil)]
+      (mv/create-mlog-with-purge-schedule! ::conn 2 11)
+      (mv/create-row-view-with-schedule! ::conn 2 5)
+      (mv/create-agg-view-with-schedule! ::conn 2 7)
+      (mv/schedule-refresh! ::conn mv/row-view 2 5)
+      (mv/schedule-purge! ::conn 2 11))
+    (is (= 5 (count @calls)))
+    (is (every? #(= {:timeout mv/setup-ddl-timeout-sec} (:opts %)) @calls))))
 
 (deftest scheduled-view-create-ddl-uses-datetime-next-expression
   (let [calls (atom [])
@@ -1342,6 +1422,109 @@
                                        (set (:sources summary)))))
     (is (= false (get-in summary [:by-node "n1" :fully-unavailable?])))
     (is (= true (get-in summary [:by-node "n2" :fully-unavailable?])))))
+
+(deftest db-identity-summary-detects-shared-backends-across-snapshot-nodes
+  (let [summary (autosched-time/db-identity-summary
+                 [{:snapshot-at-ms 0
+                   :snapshot-node "n1"
+                   :db-identity {:connection-node "n1"
+                                 :connection-target "//n1:4000/test"
+                                 :connection-id 11
+                                 :hostname "tidb-a"
+                                 :port 4000}}
+                  {:snapshot-at-ms 1
+                   :snapshot-node "n1"
+                   :db-identity {:connection-node "n1"
+                                 :connection-target "//n1:4000/test"
+                                 :connection-id 11
+                                 :hostname "tidb-a"
+                                 :port 4000}}
+                  {:snapshot-at-ms 2
+                   :snapshot-node "n2"
+                   :db-identity {:connection-node "n2"
+                                 :connection-target "//n2:4000/test"
+                                 :connection-id 12
+                                 :hostname "tidb-a"
+                                 :port 4000}}
+                  {:snapshot-at-ms 3
+                   :snapshot-node "n3"
+                   :db-identity {:connection-node "n3"
+                                 :connection-target "//n3:4000/test"
+                                 :connection-id 13
+                                 :hostname "tidb-c"
+                                 :port 4000}}])]
+    (is (= 4 (:observation-count summary)))
+    (is (= 4 (:backend-observation-count summary)))
+    (is (= 2 (:distinct-backend-count summary)))
+    (is (= [{:backend-key {:hostname "tidb-a"
+                           :port 4000}
+             :snapshot-nodes ["n1" "n2"]}]
+           (:multi-node-backends summary)))
+    (is (= 1 (get-in summary [:by-node "n1" :distinct-backend-count])))
+    (is (= ["//n2:4000/test"]
+           (get-in summary [:by-node "n2" :routing-targets])))))
+
+(deftest autosched-time-analysis-warns-when-multiple-snapshot-nodes-share-a-backend
+  (let [analysis (autosched-time/time-analysis
+                  {:nemesis-spec {:clock-skew true}}
+                  [{:type :info
+                    :f :reset-clock
+                    :clock-offsets {"n1" 0.0
+                                    "n2" 0.0}}]
+                  [{:snapshot-at-ms 0
+                    :snapshot-node "n1"
+                    :row-equal? true
+                    :agg-equal? true
+                    :row-hash 1
+                    :agg-hash 1
+                    :log-row-count 0
+                    :db-client-offset-ms 0
+                    :db-identity {:connection-node "n1"
+                                  :connection-target "//n1:4000/test"
+                                  :hostname "tidb-a"
+                                  :port 4000}}
+                   {:snapshot-at-ms 1
+                    :snapshot-node "n1"
+                    :row-equal? true
+                    :agg-equal? true
+                    :row-hash 1
+                    :agg-hash 1
+                    :log-row-count 0
+                    :db-client-offset-ms 0
+                    :db-identity {:connection-node "n1"
+                                  :connection-target "//n1:4000/test"
+                                  :hostname "tidb-a"
+                                  :port 4000}}
+                   {:snapshot-at-ms 0
+                    :snapshot-node "n2"
+                    :row-equal? true
+                    :agg-equal? true
+                    :row-hash 2
+                    :agg-hash 2
+                    :log-row-count 0
+                    :db-client-offset-ms 0
+                    :db-identity {:connection-node "n2"
+                                  :connection-target "//n2:4000/test"
+                                  :hostname "tidb-a"
+                                  :port 4000}}
+                   {:snapshot-at-ms 1
+                    :snapshot-node "n2"
+                    :row-equal? true
+                    :agg-equal? true
+                    :row-hash 2
+                    :agg-hash 2
+                    :log-row-count 0
+                    :db-client-offset-ms 0
+                    :db-identity {:connection-node "n2"
+                                  :connection-target "//n2:4000/test"
+                                  :hostname "tidb-a"
+                                  :port 4000}}])
+        warning-kinds (set (map :kind (:warnings analysis)))]
+    (is (contains? warning-kinds :shared-db-backend))
+    (is (= [{:backend-key {:hostname "tidb-a"
+                           :port 4000}
+             :snapshot-nodes ["n1" "n2"]}]
+           (get-in analysis [:db-identity-summary :multi-node-backends])))))
 
 (deftest autosched-time-check-only-uses-post-reset-snapshots
   (let [history [{:type :info

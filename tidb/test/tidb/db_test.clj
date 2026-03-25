@@ -20,6 +20,20 @@
       (is (some #{:--advertise-addr} @argv))
       (is (some #{:--config} @argv)))))
 
+(deftest normalize-binary-override-url-strips-known-component-prefix
+  (is (= "https://example.invalid/tidb.tar.gz"
+         (#'db/normalize-binary-override-url
+           "tidb:https://example.invalid/tidb.tar.gz")))
+  (is (= "https://example.invalid/tikv.tar.gz"
+         (#'db/normalize-binary-override-url
+           "tikv:https://example.invalid/tikv.tar.gz")))
+  (is (= "file:///tmp/pd.tar.gz"
+         (#'db/normalize-binary-override-url
+           "pd:file:///tmp/pd.tar.gz")))
+  (is (= "https://example.invalid/plain.tar.gz"
+         (#'db/normalize-binary-override-url
+           "https://example.invalid/plain.tar.gz"))))
+
 (deftest start-pd-service-prepares-daemon-files-for-split-services
   (doseq [svc [:api :tso :scheduling]]
     (let [prepared (atom nil)

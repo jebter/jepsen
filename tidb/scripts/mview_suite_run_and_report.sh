@@ -10,6 +10,7 @@ mview_init_root "$SCRIPT_DIR"
 SUITE="${1:-${SUITE:-}}"
 TARBALL_URL="${2:-${TARBALL_URL:-}}"
 BINARY_URLS="${3:-${BINARY_URLS:-}}"
+mview_init_binary_urls
 REPORT_FORMAT="${REPORT_FORMAT:-text}"
 SUITE_OUTPUT_DIR="${SUITE_OUTPUT_DIR:-}"
 
