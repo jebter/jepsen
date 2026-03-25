@@ -542,9 +542,15 @@
             final-row-check      (some-> refresh-row-ops last stateful/op-result)
             final-agg-check      (some-> refresh-agg-ops last stateful/op-result)
             lifecycle-history    (vec lifecycle-ops)
-            summary              {:valid?                        (and lifecycle-complete?
-                                                                        (empty? failures)
-                                                                        (empty? unresolved))
+            write-resolution-valid? (empty? unresolved)
+            lifecycle-valid?     (and lifecycle-complete?
+                                      (empty? failures))
+            summary              {:valid?                        lifecycle-valid?
+                                  :strict-valid?                 (and lifecycle-valid?
+                                                                        write-resolution-valid?)
+                                  :write-resolution-valid?       write-resolution-valid?
+                                  :recovered-write-ambiguity?    (and lifecycle-valid?
+                                                                        (not write-resolution-valid?))
                                   :lifecycle-complete?           lifecycle-complete?
                                   :expected-lifecycle-op-count   (count management-ops)
                                   :lifecycle-op-count            (count lifecycle-ops)
