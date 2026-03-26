@@ -273,13 +273,19 @@
                (recur (inc attempt)))
              (throw e))))))))
 
+(defn refresh-view-statements
+  [view]
+  ;; Current TiDB builds reject the older WITH SYNC MODE forms, so keep the
+  ;; explicit refresh fallback list to the two supported non-sync variants.
+  [(str "REFRESH MATERIALIZED VIEW " view " FAST")
+   (str "REFRESH MATERIALIZED VIEW " view " COMPLETE")])
+
 (defn refresh-view!
   [conn view]
   (try-statements!
    conn
    (str "Refresh failed for " view)
-   [(str "REFRESH MATERIALIZED VIEW " view " FAST")
-    (str "REFRESH MATERIALIZED VIEW " view " COMPLETE")]))
+   (refresh-view-statements view)))
 
 (defn purge-log!
   [conn]
