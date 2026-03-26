@@ -328,6 +328,17 @@
             (assoc op :type :info :error :indeterminate-write :exception (exception-summary t)))
         (throw t)))))
 
+(defn- maybe-long
+  [x]
+  (cond
+    (nil? x) nil
+    (number? x) (long x)
+    :else
+    (try
+      (Long/parseLong (str x))
+      (catch Throwable _
+        nil))))
+
 (defn query-db-now-ms
   [conn]
   (try
@@ -339,10 +350,21 @@
     (catch Throwable _
       nil)))
 
+(defn query-db-identity
+  [conn]
+  (try
+    (when-let [row (first (c/query conn ["SELECT CONNECTION_ID() AS connection_id, @@hostname AS hostname, @@port AS port"]))]
+      {:connection-id (maybe-long (:connection_id row))
+       :hostname      (some-> (:hostname row) str)
+       :port          (maybe-long (:port row))})
+    (catch Throwable _
+      nil)))
+
 (defn snapshot-state
   [node conn schedule-meta]
   (let [snapshot-at-ms (System/currentTimeMillis)
         db-now-ms      (query-db-now-ms conn)
+        db-identity    (query-db-identity conn)
         base-row       (mv/query-base-row-projection conn)
         mv-row         (mv/query-mv-row-projection conn)
         row-diff       (mv/full-row-diff base-row mv-row)
@@ -353,12 +375,30 @@
         log-row-count  (when log-table
                          (mv/count-table-rows conn log-table))
         schedule-ddl   (mv/read-schedule-metadata conn schedule-meta)
-        runtime-meta   (mv/read-runtime-metadata conn schedule-meta)]
+        runtime-meta   (mv/read-runtime-metadata conn schedule-meta)
+        snapshot-db-identity
+        (cond-> {}
+          (some? (::c/node conn))
+          (assoc :connection-node (str (::c/node conn)))
+
+          (some? (:subname conn))
+          (assoc :connection-target (:subname conn))
+
+          (some? (:connection-id db-identity))
+          (assoc :connection-id (:connection-id db-identity))
+
+          (some? (:hostname db-identity))
+          (assoc :hostname (:hostname db-identity))
+
+          (some? (:port db-identity))
+          (assoc :port (:port db-identity)))]
     {:snapshot-at-ms       snapshot-at-ms
      :snapshot-node        (str node)
      :db-now-ms            db-now-ms
      :db-client-offset-ms  (when db-now-ms
                              (- db-now-ms snapshot-at-ms))
+     :db-identity          (when (seq snapshot-db-identity)
+                             snapshot-db-identity)
      :row-equal?           (empty? row-diff)
      :agg-equal?           (empty? agg-diff)
      :row-diff             (when (seq row-diff) row-diff)

@@ -331,12 +331,14 @@ mview_parallel_launch_case() {
   mview_append_status "start" "$workload" "$nemesis" "$time_limit" "$run_tag" "" "" "$case_log"
 
   (
+    # Detach from suite-level stdin and output env so child runs stay isolated.
+    exec </dev/null
     export NEMESIS="$nemesis"
     export TIME_LIMIT="$time_limit"
     export MVIEW_RUN_TAG="$run_tag"
     export CREATE_QUOTA_RETRY_LIMIT CREATE_QUOTA_RETRY_DELAY_SECONDS
     export BUILD_BRANCH BUILD_COMMIT_SHA BUILD_TIME FEATURE_FLAGS BUILD_NOTES CONCURRENCY TXN_MODE TARBALL_URL BINARY_URLS
-    unset MVIEW_SUITE_OUTPUT_DIR MVIEW_RUNNER_LOG MVIEW_STATUS_TSV MVIEW_CASE_LOG_DIR
+    unset SUITE_OUTPUT_DIR MVIEW_SUITE_OUTPUT_DIR MVIEW_RUNNER_LOG MVIEW_STATUS_TSV MVIEW_CASE_LOG_DIR
     "$BRIDGE_SCRIPT" exec "$workdir" -- bash -lc "$inner_command"
   ) >"$case_log" 2>&1 &
   pid=$!

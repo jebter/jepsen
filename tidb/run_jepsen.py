@@ -9,6 +9,13 @@ from collections import OrderedDict
 
 import mview_case_catalog
 
+DEFAULT_BINARY_URLS = (
+    "tidb:https://fileserver.pingcap.net/download/builds/hotfix/tidb/"
+    "v8.5.4-20260320-7c92abd/10060/tidb-patch-linux-amd64.tar.gz,"
+    "tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/"
+    "v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz"
+)
+
 
 def shell_quote(value):
     return shlex.quote(str(value))
@@ -301,7 +308,12 @@ def main():
                         default="http://172.16.30.25/download/builds/pingcap/release/tidb-latest-linux-amd64.tar.gz",
                         help="tidb tarball url")
     parser.add_argument("--time-limit", type=int, default=120, help="time limit for each jepsen test")
-    parser.add_argument("--binary-urls", type=str, default="", help="comma separated binary override urls")
+    parser.add_argument(
+        "--binary-urls",
+        type=str,
+        default=DEFAULT_BINARY_URLS,
+        help="comma separated binary override urls",
+    )
     parser.add_argument("--build-branch", type=str, default="", help="source branch name for manifest")
     parser.add_argument("--build-commit-sha", type=str, default="", help="source commit sha for manifest")
     parser.add_argument("--build-time", type=str, default="", help="build time for manifest")

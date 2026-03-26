@@ -394,5 +394,175 @@ class MViewParallelRunnerCompletionTest(unittest.TestCase):
             self.assertEqual(1, sum(1 for row in status_rows if "\tpassed\t" in row))
 
 
+class MViewParallelRunnerStdinIsolationTest(unittest.TestCase):
+    def test_background_cases_do_not_consume_catalog_stdin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scripts_dir = root / "scripts"
+            scripts_dir.mkdir(parents=True)
+
+            (scripts_dir / "mview_common.sh").write_text(COMMON.read_text(encoding="utf-8"), encoding="utf-8")
+            (scripts_dir / "mview_parallel_suite_run_and_report.sh").write_text(
+                PARALLEL_RUNNER.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            catalog = scripts_dir / "catalog.py"
+            bridge = scripts_dir / "bridge.sh"
+            run_and_report = scripts_dir / "mview_run_and_report.sh"
+            suite_report = scripts_dir / "mview_suite_report.py"
+            store_report = scripts_dir / "mview_store_report.py"
+
+            catalog.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+
+                    rows = [
+                        ("mv-fake", "case-1", "300"),
+                        ("mv-fake", "case-2", "300"),
+                        ("mv-fake", "case-3", "300"),
+                        ("mv-fake", "case-4", "300"),
+                        ("mv-fake", "case-5", "300"),
+                    ]
+
+                    workload = None
+                    if "--workload" in sys.argv:
+                        workload = sys.argv[sys.argv.index("--workload") + 1]
+
+                    for row in rows:
+                        if workload and row[0] != workload:
+                            continue
+                        print("\\t".join(row))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            bridge.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+
+                    command="${1:-}"
+                    shift || true
+
+                    case "$command" in
+                      exec)
+                        workdir="$1"
+                        shift || true
+                        if [[ "${1:-}" == "--" ]]; then
+                          shift
+                        fi
+                        mkdir -p "$workdir"
+                        printf '{"name":"stub-testbed","items":[{"name":"node","details":{"spec":{"replicas":1}}}]}\n' > "$workdir/output"
+                        "$@"
+                        ;;
+                      cleanup)
+                        workdir="$1"
+                        rm -f "$workdir/output"
+                        ;;
+                      *)
+                        echo "unexpected bridge command: $command" >&2
+                        exit 1
+                        ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            run_and_report.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+
+                    workload="${1:-}"
+                    for leaked_var in SUITE_OUTPUT_DIR MVIEW_SUITE_OUTPUT_DIR MVIEW_RUNNER_LOG MVIEW_STATUS_TSV MVIEW_CASE_LOG_DIR; do
+                      if [[ -n "${!leaked_var:-}" ]]; then
+                        echo "unexpected leaked suite var: ${leaked_var}=${!leaked_var}" >&2
+                        exit 1
+                      fi
+                    done
+                    IFS= read -r _ || true
+                    run_dir="store/Fake ${workload} run-tag ${MVIEW_RUN_TAG} nemesis ${NEMESIS:-none}/20260322T000000"
+                    mkdir -p "$run_dir"
+                    printf 'stdin isolated for %s\n' "$MVIEW_RUN_TAG"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            suite_report.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    import sys
+
+                    if "--json" in sys.argv:
+                        print(json.dumps({"stores": sys.argv[sys.argv.index("--json") + 1 :]}))
+                    else:
+                        print("suite report ok")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            store_report.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    import sys
+
+                    if "--json" in sys.argv:
+                        print(json.dumps({"store": sys.argv[-1]}))
+                    else:
+                        print(f"store report ok: {sys.argv[-1]}")
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            catalog.chmod(0o755)
+            bridge.chmod(0o755)
+            run_and_report.chmod(0o755)
+
+            suite_output = root / "suite-output"
+            env = dict(**os.environ)
+            env.update(
+                {
+                    "MAX_PARALLEL": "1",
+                    "MVIEW_CATALOG_HELPER": str(catalog),
+                    "MVIEW_TESTBED_BRIDGE_SCRIPT": str(bridge),
+                    "SUITE_OUTPUT_DIR": str(suite_output),
+                    "WORKLOAD_FILTER": "mv-fake",
+                    "REPORT_FORMAT": "text",
+                }
+            )
+
+            proc = subprocess.run(
+                [
+                    "bash",
+                    str(scripts_dir / "mview_parallel_suite_run_and_report.sh"),
+                    "branch-validation",
+                    "http://example.invalid/tidb.tar.gz",
+                ],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+            status_rows = (suite_output / "status.tsv").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(5, sum(1 for row in status_rows if "\tpassed\t" in row))
+
+            runner_log = (suite_output / "runner.log").read_text(encoding="utf-8")
+            self.assertEqual(5, runner_log.count("case launch workload=mv-fake"))
+            self.assertIn("parallel suite end suite=branch-validation exit_code=0 new_store_dirs=5", runner_log)
+
+
 if __name__ == "__main__":
     unittest.main()

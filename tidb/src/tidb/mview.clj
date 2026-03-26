@@ -16,6 +16,7 @@
 (def refresh-lock-retry-count 8)
 (def refresh-lock-retry-base-ms 250)
 (def refresh-lock-retry-max-ms 1000)
+(def setup-ddl-timeout-sec 60)
 
 (declare try-statements!)
 
@@ -36,10 +37,12 @@
 
 (defn execute-safely!
   ([conn stmt]
-   (execute-safely! conn stmt nil))
+   (execute-safely! conn stmt nil {}))
   ([conn stmt err-msg]
+   (execute-safely! conn stmt err-msg {}))
+  ([conn stmt err-msg opts]
    (try
-     (c/execute! conn [stmt])
+     (c/execute! conn [stmt] opts)
      true
      (catch java.sql.SQLException e
        (when err-msg
@@ -52,7 +55,10 @@
                 (str "DROP MATERIALIZED VIEW " row-view)
                 (str "DROP MATERIALIZED VIEW LOG ON " base-table)
                 (str "DROP TABLE IF EXISTS " base-table)]]
-    (execute-safely! conn stmt "Ignoring MV cleanup error:")))
+    (execute-safely! conn
+                     stmt
+                     "Ignoring MV cleanup error:"
+                     {:timeout setup-ddl-timeout-sec})))
 
 (defn create-base-table!
   [conn]
@@ -65,7 +71,8 @@
                     " last_token varchar(128) NOT NULL,\n"
                     " deleted    tinyint      NOT NULL DEFAULT 0,\n"
                     " pad        varchar(64)  NOT NULL,\n"
-                    " KEY idx_mv_stateful_g1_deleted_v1 (g1, deleted, v1))")]))
+                    " KEY idx_mv_stateful_g1_deleted_v1 (g1, deleted, v1))")]
+              {:timeout setup-ddl-timeout-sec}))
 
 (defn split-base-table!
   [conn ids]
@@ -76,7 +83,8 @@
     (when-not (str/blank? splits)
       (execute-safely! conn
                        (str "split table " base-table " by " splits)
-                       "Ignoring unsupported split-table syntax:"))))
+                       "Ignoring unsupported split-table syntax:"
+                       {:timeout setup-ddl-timeout-sec}))))
 
 (defn create-mlog!
   [conn]
@@ -86,7 +94,8 @@
    [(str "CREATE MATERIALIZED VIEW LOG ON " base-table
          " (id, g1, v1, version, last_token, deleted)")
     (str "CREATE MATERIALIZED VIEW LOG ON " base-table
-         " (id, g1, v1, version, last_token, deleted) PURGE IMMEDIATE")]))
+         " (id, g1, v1, version, last_token, deleted) PURGE IMMEDIATE")]
+   {:timeout setup-ddl-timeout-sec}))
 
 (defn drop-row-view!
   [conn]
@@ -122,7 +131,8 @@
                           " (id, g1, v1, version, last_token, deleted) "
                           "START WITH " start-expr " "
                           "NEXT " next-expr)])
-                  (schedule-clause-pairs start-delay next-seconds))))
+                  (schedule-clause-pairs start-delay next-seconds)))
+         {:timeout setup-ddl-timeout-sec})
         (catch java.sql.SQLException _
           nil))
       (create-mlog! conn)))
@@ -137,7 +147,8 @@
                     "SELECT id, g1, v1, version, last_token, COUNT(*) AS live_cnt "
                     "FROM " base-table " "
                     "WHERE deleted = 0 "
-                    "GROUP BY id, g1, v1, version, last_token")]))
+                    "GROUP BY id, g1, v1, version, last_token")]
+              {:timeout setup-ddl-timeout-sec}))
 
 (defn create-row-view-with-schedule!
   [conn start-delay next-seconds]
@@ -154,7 +165,8 @@
                 "FROM " base-table " "
                 "WHERE deleted = 0 "
                 "GROUP BY id, g1, v1, version, last_token"))
-         (schedule-clause-pairs start-delay next-seconds))))
+         (schedule-clause-pairs start-delay next-seconds))
+   {:timeout setup-ddl-timeout-sec}))
 
 (defn create-agg-view!
   [conn]
@@ -170,7 +182,8 @@
                     "MAX(v1)  AS max_v1 "
                     "FROM " base-table " "
                     "WHERE deleted = 0 "
-                    "GROUP BY g1")]))
+                    "GROUP BY g1")]
+              {:timeout setup-ddl-timeout-sec}))
 
 (defn create-agg-view-with-schedule!
   [conn start-delay next-seconds]
@@ -191,7 +204,8 @@
                 "FROM " base-table " "
                 "WHERE deleted = 0 "
                 "GROUP BY g1"))
-         (schedule-clause-pairs start-delay next-seconds))))
+         (schedule-clause-pairs start-delay next-seconds))
+   {:timeout setup-ddl-timeout-sec}))
 
 (defn- refresh-lock-conflict?
   [^java.sql.SQLException e]
@@ -215,12 +229,14 @@
               message))))
 
 (defn- try-statements-once!
-  [conn label statements]
+  ([conn label statements]
+   (try-statements-once! conn label statements {}))
+  ([conn label statements opts]
   (loop [remaining statements
          last-error nil]
     (if-let [stmt (first remaining)]
       (let [result (try
-                     {:stmt (do (c/execute! conn [stmt]) stmt)}
+                     {:stmt (do (c/execute! conn [stmt] opts) stmt)}
                      (catch java.sql.SQLException e
                        (info label (.getMessage e) "stmt=" stmt)
                        (if (or (refresh-lock-conflict? e)
@@ -232,28 +248,30 @@
           (recur (rest remaining) (:error result))))
       (if last-error
         (throw last-error)
-        nil))))
+        nil)))))
 
 (defn- try-statements!
-  [conn label statements]
-  (loop [attempt 1]
-    (let [result (try
-                   {:stmt (try-statements-once! conn label statements)}
-                   (catch java.sql.SQLException e
-                     {:error e}))]
-      (if-let [stmt (:stmt result)]
-        stmt
-        (let [e (:error result)]
-          (if (and (refresh-lock-conflict? e)
-                   (< attempt refresh-lock-retry-count))
-            (let [delay-ms (refresh-lock-retry-delay-ms attempt)]
-              (info label "Retrying after transient lock conflict"
-                    "attempt=" attempt
-                    "sleep-ms=" delay-ms
-                    "error=" (.getMessage e))
-              (Thread/sleep delay-ms)
-              (recur (inc attempt)))
-            (throw e)))))))
+  ([conn label statements]
+   (try-statements! conn label statements {}))
+  ([conn label statements opts]
+   (loop [attempt 1]
+     (let [result (try
+                    {:stmt (try-statements-once! conn label statements opts)}
+                    (catch java.sql.SQLException e
+                      {:error e}))]
+       (if-let [stmt (:stmt result)]
+         stmt
+         (let [e (:error result)]
+           (if (and (refresh-lock-conflict? e)
+                    (< attempt refresh-lock-retry-count))
+             (let [delay-ms (refresh-lock-retry-delay-ms attempt)]
+               (info label "Retrying after transient lock conflict"
+                     "attempt=" attempt
+                     "sleep-ms=" delay-ms
+                     "error=" (.getMessage e))
+               (Thread/sleep delay-ms)
+               (recur (inc attempt)))
+             (throw e))))))))
 
 (defn refresh-view!
   [conn view]
@@ -285,7 +303,8 @@
                (str "ALTER MATERIALIZED VIEW " view
                     " START WITH " start-expr
                     " NEXT " next-expr)])
-            (schedule-clause-pairs start-delay next-seconds)))))
+            (schedule-clause-pairs start-delay next-seconds)))
+   {:timeout setup-ddl-timeout-sec}))
 
 (defn schedule-purge!
   [conn start-delay next-seconds]
@@ -300,7 +319,8 @@
                (str "ALTER MATERIALIZED VIEW LOG ON " base-table
                     " START WITH " start-expr
                     " NEXT " next-expr)])
-            (schedule-clause-pairs start-delay next-seconds)))))
+            (schedule-clause-pairs start-delay next-seconds)))
+   {:timeout setup-ddl-timeout-sec}))
 
 (defn list-table-names
   [conn]

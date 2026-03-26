@@ -533,6 +533,109 @@
 
 (def timer-metadata-summary runtime-metadata-summary)
 
+(def db-identity-summary-keys
+  [:connection-node
+   :connection-target
+   :connection-id
+   :hostname
+   :port])
+
+(defn- backend-key
+  [identity]
+  (cond
+    (and (:hostname identity) (some? (:port identity)))
+    {:hostname (:hostname identity)
+     :port     (:port identity)}
+
+    (:hostname identity)
+    {:hostname (:hostname identity)}
+
+    :else
+    nil))
+
+(defn db-identity-observations
+  [snapshots]
+  (->> snapshots
+       (keep (fn [snapshot]
+               (when-let [identity (:db-identity snapshot)]
+                 {:snapshot-at-ms    (:snapshot-at-ms snapshot)
+                  :snapshot-node     (:snapshot-node snapshot)
+                  :db-identity       (select-keys identity db-identity-summary-keys)
+                  :backend-key       (backend-key identity)
+                  :connection-target (:connection-target identity)
+                  :connection-node   (:connection-node identity)})))
+       vec))
+
+(defn- summarize-db-identity-observations
+  [observations]
+  (let [observations         (->> observations
+                                  (sort-by (juxt :snapshot-at-ms :snapshot-node))
+                                  vec)
+        backend-observations (keep :backend-key observations)
+        backend-keys         (->> backend-observations
+                                  distinct
+                                  (sort-by pr-str)
+                                  vec)
+        routing-targets      (->> observations
+                                  (map :connection-target)
+                                  (remove nil?)
+                                  distinct
+                                  sort
+                                  vec)]
+    {:observation-count       (count observations)
+     :backend-observation-count (count backend-observations)
+     :distinct-backend-count  (count backend-keys)
+     :backend-keys            backend-keys
+     :routing-targets         routing-targets
+     :stable-backend?         (<= (count backend-keys) 1)
+     :first-observation       (first observations)
+     :latest-observation      (last observations)}))
+
+(defn db-identity-summary
+  [snapshots]
+  (let [series-by-node       (->> (snapshots-by-node snapshots)
+                                  (into (sorted-map)
+                                        (map (fn [[node node-snapshots]]
+                                               [node (db-identity-observations node-snapshots)]))))
+        by-node              (into (sorted-map)
+                                   (map (fn [[node observations]]
+                                          [node (summarize-db-identity-observations observations)]))
+                                   series-by-node)
+        node-summaries       (vals by-node)
+        backend-aliases      (->> by-node
+                                  (mapcat (fn [[node summary]]
+                                            (for [backend-key (:backend-keys summary)]
+                                              {:backend-key backend-key
+                                               :snapshot-node node})))
+                                  (group-by :backend-key)
+                                  (keep (fn [[backend-key entries]]
+                                          (let [snapshot-nodes (->> entries
+                                                                    (map :snapshot-node)
+                                                                    distinct
+                                                                    sort
+                                                                    vec)]
+                                            (when (> (count snapshot-nodes) 1)
+                                              {:backend-key backend-key
+                                               :snapshot-nodes snapshot-nodes}))))
+                                  (sort-by (juxt #(count (:snapshot-nodes %))
+                                                 #(pr-str (:backend-key %))))
+                                  reverse
+                                  vec)]
+    {:observation-count        (reduce + 0 (map :observation-count node-summaries))
+     :backend-observation-count (reduce + 0 (map :backend-observation-count node-summaries))
+     :distinct-backend-count   (->> node-summaries
+                                    (mapcat :backend-keys)
+                                    distinct
+                                    count)
+     :multi-node-backends      backend-aliases
+     :first-observation        (earliest-event (map :first-observation node-summaries))
+     :latest-observation       (->> node-summaries
+                                    (map :latest-observation)
+                                    (remove nil?)
+                                    (sort-by (juxt :snapshot-at-ms :snapshot-node))
+                                    last)
+     :by-node                  by-node}))
+
 (defn anomaly
   ([kind severity message]
    (anomaly kind severity message nil))
@@ -621,6 +724,7 @@
                                          node-analysis)
         metadata-summary           (schedule-metadata-summary snapshots)
         runtime-summary            (runtime-metadata-summary snapshots)
+        db-identity-summary        (db-identity-summary snapshots)
         missing-convergence        (first-node-match node-analysis
                                                     #(and (nil? (:first-converged-idx %))
                                                           (>= (:quiet-window-ms %) (convergence-budget-ms))))
@@ -772,6 +876,12 @@
                    :warning
                    "fallback mysql.tidb_timers was readable but no rows matched the MV object names"
                    {:runtime-metadata runtime-summary}))
+        shared-db-backend-warning
+        (when (seq (:multi-node-backends db-identity-summary))
+          (anomaly :shared-db-backend
+                   :warning
+                   "multiple snapshot nodes reported the same SQL backend identity during quiet phase"
+                   {:shared-backends (:multi-node-backends db-identity-summary)}))
         clause-unverified-warning  (first-best-effort-clause-missing-warning metadata-summary)
         hard-anomalies             (cond-> []
                                      (and requested? (not clock-skew-supported?))
@@ -854,6 +964,9 @@
                                      runtime-metadata-unmatched-warning
                                      (conj runtime-metadata-unmatched-warning)
 
+                                     shared-db-backend-warning
+                                     (conj shared-db-backend-warning)
+
                                      clause-unverified-warning
                                      (conj clause-unverified-warning))]
     {:warning                  skeleton-warning
@@ -877,6 +990,7 @@
      :snapshot-offset-summary  residual-offsets
      :schedule-metadata        metadata-summary
      :runtime-metadata         runtime-summary
+     :db-identity-summary      db-identity-summary
      :clock-events             clock-ops
      :clock-summary            (offset-summary clock-ops)
      :purge-progress           purge-state

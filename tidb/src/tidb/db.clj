@@ -40,6 +40,7 @@
 (def db-slow-file   (str tidb-dir "/slow.log"))
 (def db-stdout      (str tidb-dir "/db.stdout"))
 (def db-pid-file    (str tidb-dir "/db.pid"))
+(def install-diagnostics-file (str tidb-dir "/install-diagnostics.txt"))
 (def system-db-config-file (str tidb-dir "/system-db.conf"))
 (def system-db-log-file    (str tidb-dir "/system-db.log"))
 (def system-db-slow-file   (str tidb-dir "/system-slow.log"))
@@ -47,6 +48,7 @@
 (def system-db-pid-file    (str tidb-dir "/system-db.pid"))
 (def system-db-port        14000)
 (def system-db-status-port 11080)
+(def binary-override-prefix-re #"^(tidb|tikv|pd):((?:https?|file)://.+)$")
 (def pd-services
   {:api
    {:bin "pd-api"
@@ -99,6 +101,14 @@
   "The HTTP url for other peers to talk to a node."
   [node]
   (node-url node peer-port))
+
+(defn- normalize-binary-override-url
+  [url]
+  (if-let [[_ _ normalized-url]
+           (and (string? url)
+                (re-matches binary-override-prefix-re url))]
+    normalized-url
+    url))
 
 (defn initial-cluster
   "Constructs an initial cluster string for a test, like
@@ -717,6 +727,44 @@
     :else
     {:error e}))
 
+(defn write-install-diagnostics!
+  "Persist pre-start install state so setup failures before daemon launch still
+  leave behind useful artifacts."
+  [node]
+  (c/su
+    (normalize-file-path! install-diagnostics-file)
+    (c/exec :bash :-lc
+            (str "set -euo pipefail\n"
+                 "{\n"
+                 "  echo \"timestamp: $(date -Is)\"\n"
+                 "  echo \"node: " node "\"\n"
+                 "  echo \"tidb-dir: " tidb-dir "\"\n"
+                 "  echo \"tidb-bin-dir: " tidb-bin-dir "\"\n"
+                 "  echo\n"
+                 "  echo \"[df -h /opt /tmp]\"\n"
+                 "  df -h /opt /tmp || true\n"
+                 "  echo\n"
+                 "  echo \"[du -sh " tidb-dir " " tidb-bin-dir "]\"\n"
+                 "  du -sh " tidb-dir " " tidb-bin-dir " || true\n"
+                 "  echo\n"
+                 "  echo \"[ls -lah " tidb-dir "]\"\n"
+                 "  ls -lah " tidb-dir " || true\n"
+                 "  echo\n"
+                 "  echo \"[ls -lah " tidb-bin-dir "]\"\n"
+                 "  ls -lah " tidb-bin-dir " || true\n"
+                 "  echo\n"
+                 "  echo \"[required-binaries]\"\n"
+                 "  for b in " pd-bin " " kv-bin " " db-bin "; do\n"
+                 "    echo \"-- $b\"\n"
+                 "    ls -l " tidb-bin-dir "/$b || true\n"
+                 "    readlink -f " tidb-bin-dir "/$b || true\n"
+                 "    stat -c '%n %s %y' " tidb-bin-dir "/$b || true\n"
+                 "  done\n"
+                 "  echo\n"
+                 "  echo \"[find " tidb-bin-dir " -maxdepth 2]\"\n"
+                 "  find " tidb-bin-dir " -maxdepth 2 -print | sort || true\n"
+                 "} > " install-diagnostics-file " 2>&1"))))
+
 (defn log-install-stage
   [node stage fields]
   (info node "TiDB install" (merge {:stage stage} fields)))
@@ -771,12 +819,14 @@
                            :failure-bucket :bin-layout-failed}
                           #(ensure-bin-layout!))
       (doseq [url (:binary-urls test)]
-        (run-install-stage! node :binary-override
-                            {:url url
-                             :dest tidb-bin-dir
-                             :failure-bucket :override-download-or-extract-failed}
-                            #(let [f (cu/cached-wget! url)]
-                               (c/exec :tar :-xf f :-C tidb-bin-dir))))
+        (let [download-url (normalize-binary-override-url url)]
+          (run-install-stage! node :binary-override
+                              (cond-> {:url download-url
+                                       :dest tidb-bin-dir
+                                       :failure-bucket :override-download-or-extract-failed}
+                                (not= download-url url) (assoc :requested-url url))
+                              #(let [f (cu/cached-wget! download-url)]
+                                 (c/exec :tar :-xf f :-C tidb-bin-dir)))))
       (run-install-stage! node :component-links
                           {:dest tidb-bin-dir
                            :failure-bucket :override-link-failed}
@@ -790,6 +840,11 @@
         (info "Creating symbol links for PD services")
         (doseq [[_ info] pd-services]
           (c/exec :ln :-sf (str tidb-bin-dir "/" pd-bin) (str tidb-bin-dir "/" (get info :bin)))))
+      (try+
+        (write-install-diagnostics! node)
+        (catch Object e
+          (warn node "Unable to persist install diagnostics"
+                (install-error-summary e))))
       (run-install-stage! node :sync
                           {:failure-bucket :sync-failed}
                           #(do
@@ -926,6 +981,7 @@
         (let [base (cond-> [db-log-file
                             db-slow-file
                             db-stdout
+                            install-diagnostics-file
                             kv-log-file
                             kv-stdout]
                      (:enable-system-tidb test)
