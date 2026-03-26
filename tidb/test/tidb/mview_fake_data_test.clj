@@ -1843,6 +1843,13 @@
       (is (= stmt (mv/refresh-view! ::conn mv/row-view)))
       (is (= [stmt] @calls)))))
 
+(deftest mview-refresh-view-statements-drop-legacy-sync-mode-forms
+  (let [statements (mv/refresh-view-statements mv/row-view)]
+    (is (= [(str "REFRESH MATERIALIZED VIEW " mv/row-view " FAST")
+            (str "REFRESH MATERIALIZED VIEW " mv/row-view " COMPLETE")]
+           statements))
+    (is (every? #(not (re-find #"SYNC MODE" %)) statements))))
+
 (deftest ensure-bin-layout-finishes-interrupted-single-file-normalization
   (let [root-bin    (str db/tidb-dir ".root-bin")
         db-bin-path (str db/tidb-dir "/" db/db-bin)
