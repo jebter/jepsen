@@ -153,6 +153,17 @@
   (or (ambiguous-write-error? t)
       (instance? NullPointerException t)))
 
+(defn retryable-snapshot-error?
+  [t]
+  (let [chain   (take-while some? (iterate #(.getCause %) t))
+        message (->> chain
+                     (map #(.getMessage %))
+                     (remove nil?)
+                     (str/join " | "))]
+    (boolean
+     (or (retryable-write-error? t)
+         (re-find #"PD server timeout: start timestamp may fall behind safe point" message)))))
+
 (def op-timeout-ms
   (+ c/socket-timeout 5000))
 
@@ -421,7 +432,7 @@
 (defn snapshot-with-reconnect!
   [conn-holder node test op schedule-meta]
   (try
-    (with-reconnect! conn-holder node test retryable-write-error?
+    (with-reconnect! conn-holder node test retryable-snapshot-error?
       #(assoc op :type :ok :result (snapshot-state node % schedule-meta)))
     (catch Throwable t
       (assoc op :type :fail :error :snapshot-error :exception (exception-summary t)))))

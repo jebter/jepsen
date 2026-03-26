@@ -15,7 +15,7 @@
             [tidb.db :as db]
             [tidb.util :as tu]
             [clojure.tools.logging :refer :all]
-            [slingshot.slingshot :refer [try+ throw+]]))
+            [slingshot.slingshot :refer [try+]]))
 
 (defn process-nemesis
   "A nemesis that can pause, resume, start, stop, and kill tidb, tikv, and pd."
@@ -318,6 +318,35 @@
      (->> test :nodes nemesis/split-one nemesis/complete-grudge)
      :partition-type :single-node))
 
+(defn partition-failure-detail
+  [failure]
+  (cond
+    (map? failure)
+    failure
+
+    (instance? Throwable failure)
+    (cond-> {:class (.getName (class failure))}
+      (.getMessage ^Throwable failure)
+      (assoc :message (.getMessage ^Throwable failure)))
+
+    :else
+    {:value (pr-str failure)}))
+
+(defn partition-pd-leader-fallback-op
+  [test process reason & [failure]]
+  (let [detail   (some-> failure partition-failure-detail)
+        log-data (cond-> {:requested-partition-type :pd-leader
+                          :partition-fallback      :single-node
+                          :reason                  reason}
+                   detail (assoc :detail detail))]
+    (warn "Unable to construct pd-leader partition nemesis op; falling back to single-node partition"
+          log-data)
+    (cond-> (assoc (partition-one-gen test process)
+                   :requested-partition-type :pd-leader
+                   :partition-fallback? true
+                   :partition-fallback-reason reason)
+      detail (assoc :partition-fallback-detail detail))))
+
 (defn partition-pd-leader-gen
   "A generator for a partition that isolates the current PD leader in a
   minority."
@@ -330,18 +359,9 @@
             components (split-at 1 nodes) ; Maybe later rand(n/2+1?)
             grudge     (nemesis/complete-grudge components)]
         (op :start-partition, grudge, :partition-type :pd-leader))
-      (throw+ {:type                     ::pd-leader-partition-unavailable
-               :requested-partition-type :pd-leader
-               :reason                   :leader-unresolved}))
-    (catch [:type ::pd-leader-partition-unavailable] e
-      (warn "Unable to construct pd-leader partition nemesis op" e)
-      (throw+ e))
+      (partition-pd-leader-fallback-op test process :leader-unresolved))
     (catch Object e
-      (let [failure {:type                     ::pd-leader-partition-unavailable
-                     :requested-partition-type :pd-leader
-                     :reason                   {:leader-resolution-error e}}]
-        (warn "Unable to construct pd-leader partition nemesis op" failure)
-        (throw+ failure)))))
+      (partition-pd-leader-fallback-op test process :leader-resolution-error e))))
 
 (defn partition-half-gen
   "A generator for a partition that cuts the network in half."
