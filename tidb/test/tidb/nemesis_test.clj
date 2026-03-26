@@ -85,26 +85,39 @@
       (jn/invoke! n test {:type :info :f :start-kv})
       (is (= [[:node-1 :node-2] [:node-1] [:node-2]] @targets)))))
 
-(deftest partition-pd-leader-gen-fails-when-leader-unresolved
+(deftest partition-pd-leader-gen-falls-back-when-leader-unresolved
   (let [test {:nodes [:node-0 :node-1 :node-2 :node-3 :node-4]}]
     (with-redefs [rand-nth first
-                  db/pd-leader-node (fn [_ _] nil)]
-      (try+
-        (nemesis/partition-pd-leader-gen test nil)
-        (is false "expected pd-leader partition generation to fail")
-        (catch [:type ::nemesis/pd-leader-partition-unavailable] e
-          (is (= :pd-leader (:requested-partition-type e)))
-          (is (= :leader-unresolved (:reason e))))))))
+                  db/pd-leader-node (fn [_ _] nil)
+                  nemesis/partition-one-gen (fn [_ _]
+                                              {:type :info
+                                               :f :start-partition
+                                               :value :fallback
+                                               :partition-type :single-node})]
+      (is (= {:type :info
+              :f :start-partition
+              :value :fallback
+              :partition-type :single-node
+              :requested-partition-type :pd-leader
+              :partition-fallback? true
+              :partition-fallback-reason :leader-unresolved}
+             (nemesis/partition-pd-leader-gen test nil))))))
 
-(deftest partition-pd-leader-gen-fails-when-leader-resolution-errors
+(deftest partition-pd-leader-gen-falls-back-when-leader-resolution-errors
   (let [test {:nodes [:node-0 :node-1 :node-2 :node-3 :node-4]}]
     (with-redefs [rand-nth first
-                  db/pd-leader-node (fn [_ _] (throw+ {:status 404 :type :test-error}))]
-      (try+
-        (nemesis/partition-pd-leader-gen test nil)
-        (is false "expected pd-leader partition generation to fail")
-        (catch [:type ::nemesis/pd-leader-partition-unavailable] e
-          (is (= :pd-leader (:requested-partition-type e)))
-          (is (map? (:reason e)))
-          (is (= {:status 404 :type :test-error}
-                 (:leader-resolution-error (:reason e)))))))))
+                  db/pd-leader-node (fn [_ _] (throw+ {:status 404 :type :test-error}))
+                  nemesis/partition-one-gen (fn [_ _]
+                                              {:type :info
+                                               :f :start-partition
+                                               :value :fallback
+                                               :partition-type :single-node})]
+      (is (= {:type :info
+              :f :start-partition
+              :value :fallback
+              :partition-type :single-node
+              :requested-partition-type :pd-leader
+              :partition-fallback? true
+              :partition-fallback-reason :leader-resolution-error
+              :partition-fallback-detail {:status 404 :type :test-error}}
+             (nemesis/partition-pd-leader-gen test nil))))))
