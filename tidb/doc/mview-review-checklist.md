@@ -144,6 +144,12 @@ Required properties:
 - execution shape is pinned (`workload`, `nemesis`, `time_limit`, `concurrency`)
 - repro command is copy/paste-safe
 
+If a review or handoff includes a standalone Jepsen jar for remote `JAR_URL` execution, also require:
+
+- jar compatibility is checked before upload with `scripts/check_jar_compat.sh`
+- no root class exceeds Java 8 bytecode level
+- no root class references post-Java-8 sequenced collection APIs such as `java.util.SequencedCollection`
+
 Typical bugs found this way:
 
 - dynamic arguments are missing from the manifest
@@ -227,6 +233,7 @@ Add targeted one-off checks when relevant, for example:
 - generate a repro command with quotes and query parameters
 - run report aggregation on a temporary empty directory
 - run store discovery against a layout containing `store/suites/*`
+- run `bash scripts/check_jar_compat.sh <standalone-jar>` before publishing or updating a remote `JAR_URL`
 
 ## How to write review findings
 

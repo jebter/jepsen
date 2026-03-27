@@ -43,6 +43,24 @@ Switch to `test-plan` after direct Jepsen validation proves the workload baselin
 
 Do not start with `tcctl run` when a direct `none` Jepsen run is still failing in the workload itself. That only adds an extra orchestration layer and slows triage.
 
+## Gate standalone jars before remote `JAR_URL` runs
+
+When a `test-plan` or one-shot reproduction depends on a standalone Jepsen jar uploaded as `JAR_URL`, validate that jar before uploading it or changing the plan.
+
+Run:
+
+```bash
+cd tidb
+bash scripts/check_jar_compat.sh /path/to/jepsen-standalone.jar
+```
+
+This check exists to catch the exact regression class we already hit in MView work:
+
+- class files compiled above Java 8 bytecode level
+- root classes that reference post-Java-8 sequenced collection APIs such as `java.util.SequencedCollection`
+
+Stop and fix the jar if this check fails. Do not continue to `tcctl run` just to rediscover a startup crash on the remote JVM.
+
 ## Standard debug order
 
 Use this order unless a user explicitly asks for something narrower.
@@ -164,6 +182,8 @@ The resulting store must include:
 - `build/manifest.json`
 
 If the manifest is missing or malformed, fix that first. Otherwise later failures are hard to reproduce across threads.
+
+For remote one-shot or `test-plan` runs that also override `JAR_URL`, treat jar compatibility as part of the pinned build identity. A manifest alone is not enough if the uploaded standalone jar cannot start on the remote JVM.
 
 ## Artifact-first triage order
 
