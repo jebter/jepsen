@@ -817,10 +817,16 @@
             final-row-valid? (boolean (and final-row-op (op/ok? final-row-op)))
             final-agg-valid? (boolean (and final-agg-op (op/ok? final-agg-op)))
             ever-row-failed? (boolean first-row-failure)
-            ever-agg-failed? (boolean first-agg-failure)]
-        (let [summary {:valid?                    (and final-row-valid?
-                                                      final-agg-valid?
-                                                      (empty? unresolved))
+            ever-agg-failed? (boolean first-agg-failure)
+            write-resolution-valid? (empty? unresolved)
+            stateful-valid? (and final-row-valid?
+                                 final-agg-valid?)]
+        (let [summary {:valid?                    stateful-valid?
+                       :strict-valid?             (and stateful-valid?
+                                                      write-resolution-valid?)
+                       :write-resolution-valid?   write-resolution-valid?
+                       :recovered-write-ambiguity? (and stateful-valid?
+                                                        (not write-resolution-valid?))
                        :final-row-valid?          final-row-valid?
                        :final-agg-valid?          final-agg-valid?
                        :ever-row-failed?          ever-row-failed?

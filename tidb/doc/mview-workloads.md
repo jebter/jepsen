@@ -40,6 +40,7 @@ Current checker contract:
 - active-phase row or aggregate failures are retained in the summary separately from final-phase checks
 - intermediate row or aggregate failures are retained in the summary, even if later explicit refreshes recover
 - the summary reports whether those failures recovered before the final oracle
+- unresolved write ambiguity is still surfaced via `strict-valid?` and `first-unresolved-write`, but it does not fail an otherwise correct final refresh oracle by itself
 
 ### `mv-lifecycle`
 
