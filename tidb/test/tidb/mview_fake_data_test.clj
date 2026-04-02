@@ -1928,6 +1928,9 @@
                  {:type :ok :phase :final :f :refresh-agg :process 0 :result {:groups 2}}]
         summary (checker/check (stateful/checker*) {} history nil)]
     (is (true? (:valid? summary)))
+    (is (true? (:strict-valid? summary)))
+    (is (true? (:write-resolution-valid? summary)))
+    (is (false? (:recovered-write-ambiguity? summary)))
     (is (true? (:final-row-valid? summary)))
     (is (true? (:final-agg-valid? summary)))
     (is (true? (:ever-row-failed? summary)))
@@ -1954,6 +1957,41 @@
     (is (nil? (:first-final-agg-failure summary)))
     (is (= "mv-stateful/first-row-failure.edn" (:first-row-failure-path summary)))
     (is (= "mv-stateful/first-agg-failure.edn" (:first-agg-failure-path summary)))))
+
+(deftest stateful-checker-separates-write-ambiguity-from-final-oracle
+  (let [token            "mv-stateful-test-42"
+        unresolved-write {:type :info
+                          :f :insert
+                          :process 2
+                          :time 42
+                          :value {:id 3
+                                  :g1 3
+                                  :v1 300042
+                                  :version 42
+                                  :last-token token
+                                  :deleted false
+                                  :pad (stateful/pad-for token)}
+                          :error :indeterminate-write
+                          :exception "Query timed out"}
+        history          [unresolved-write
+                          {:type :fail
+                           :phase :active
+                           :f :refresh-agg
+                           :process 0
+                           :result {:diff {:unexpected-in-mv [0]}}}
+                          {:type :ok :phase :final :f :refresh-row :process 0 :result {:rows 2}}
+                          {:type :ok :phase :final :f :refresh-agg :process 0 :result {:groups 2}}]
+        summary          (checker/check (stateful/checker*) {} history nil)]
+    (is (true? (:valid? summary)))
+    (is (false? (:strict-valid? summary)))
+    (is (false? (:write-resolution-valid? summary)))
+    (is (true? (:recovered-write-ambiguity? summary)))
+    (is (true? (:final-row-valid? summary)))
+    (is (true? (:final-agg-valid? summary)))
+    (is (= 1 (:unresolved-write-count summary)))
+    (is (= unresolved-write (:first-unresolved-write summary)))
+    (is (= :refresh-agg (:f (:first-failure summary))))
+    (is (= :refresh-agg (:f (:first-agg-failure summary))))))
 
 (deftest stateful-checker-downgrades-window-compatible-active-failures
   (let [history (vec
@@ -2016,6 +2054,9 @@
                                                  :actual   {:cnt 1}}}}}}]
         summary (checker/check (stateful/checker*) {} history nil)]
     (is (false? (:valid? summary)))
+    (is (false? (:strict-valid? summary)))
+    (is (true? (:write-resolution-valid? summary)))
+    (is (false? (:recovered-write-ambiguity? summary)))
     (is (true? (:final-row-valid? summary)))
     (is (false? (:final-agg-valid? summary)))
     (is (false? (:ever-row-failed? summary)))
