@@ -91,7 +91,7 @@ MAX_PARALLEL=3 WORKLOAD_FILTER=mv-lifecycle scripts/mview_parallel_suite_run_and
 
 Current default binary override pair for MView lines and debug runs:
 
-- `tidb:https://fileserver.pingcap.net/download/builds/devbuild/10254/tidb-linux-amd64.tar.gz`
+- `tidb:https://fileserver.pingcap.net/download/builds/devbuild/10260/tidb-linux-amd64.tar.gz`
 - `tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz`
 
 The repo wrappers, raw `lein run test`, and `run_jepsen.py` now default to this pair. Pass `--binary-urls` or `BINARY_URLS` explicitly only when you need to override it.
