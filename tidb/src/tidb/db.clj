@@ -41,6 +41,7 @@
 (def db-stdout      (str tidb-dir "/db.stdout"))
 (def db-pid-file    (str tidb-dir "/db.pid"))
 (def install-diagnostics-file (str tidb-dir "/install-diagnostics.txt"))
+(def install-sync-timeout-ms 30000)
 (def system-db-config-file (str tidb-dir "/system-db.conf"))
 (def system-db-log-file    (str tidb-dir "/system-db.log"))
 (def system-db-slow-file   (str tidb-dir "/system-slow.log"))
@@ -785,6 +786,54 @@
                                   (install-error-summary e)))
         (install-rethrow! e)))))
 
+(defn best-effort-sync-disks!
+  "Try to flush the extracted tarball to disk, but do not let one slow node
+  block setup for every node in the cluster."
+  [node]
+  (let [started-at (System/nanoTime)]
+    (log-install-stage node :sync-start
+                       {:failure-bucket :sync-failed
+                        :timeout-ms install-sync-timeout-ms
+                        :best-effort true})
+    (let [result (util/timeout install-sync-timeout-ms
+                               {:status :timeout}
+                               (try+
+                                 (info "Syncing disks to avoid slow fsync on db start")
+                                 (c/exec :sync)
+                                 {:status :ok}
+                                 (catch Object e
+                                   {:status :error
+                                    :error  (install-error-summary e)})))]
+      (case (:status result)
+        :ok
+        (do
+          (log-install-stage node :sync-done
+                             {:failure-bucket :sync-failed
+                              :timeout-ms install-sync-timeout-ms
+                              :best-effort true
+                              :elapsed-ms (install-elapsed-ms started-at)})
+          (info "Syncing disks done"))
+
+        :timeout
+        (do
+          (log-install-stage node :sync-timeout
+                             {:failure-bucket :sync-failed
+                              :timeout-ms install-sync-timeout-ms
+                              :best-effort true
+                              :elapsed-ms (install-elapsed-ms started-at)})
+          (warn node "Syncing disks timed out; continuing setup without waiting for it"))
+
+        :error
+        (do
+          (log-install-stage node :sync-error
+                             (merge {:failure-bucket :sync-failed
+                                     :timeout-ms install-sync-timeout-ms
+                                     :best-effort true
+                                     :elapsed-ms (install-elapsed-ms started-at)}
+                                    (:error result)))
+          (warn node "Syncing disks failed; continuing setup"
+                (:error result)))))))
+
 ; (defn setup-faketime!
 ;   "Configures the faketime wrapper for this node, so that the given binary runs
 ;   at the given rate."
@@ -845,12 +894,7 @@
         (catch Object e
           (warn node "Unable to persist install diagnostics"
                 (install-error-summary e))))
-      (run-install-stage! node :sync
-                          {:failure-bucket :sync-failed}
-                          #(do
-                             (info "Syncing disks to avoid slow fsync on db start")
-                             (c/exec :sync)))
-      (info "Syncing disks done")
+      (best-effort-sync-disks! node)
     ; (if-let [ratio (:faketime test)]
     ;   (do ; We need a special fork of faketime specifically for tikv, which
     ;       ; uses CLOCK_MONOTONIC_COARSE (not supported by 0.9.6 stock), and

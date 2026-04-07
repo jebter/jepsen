@@ -146,7 +146,7 @@ Required properties:
 
 If a review or handoff includes a standalone Jepsen jar for remote `JAR_URL` execution, also require:
 
-- jar compatibility is checked before upload with `scripts/check_jar_compat.sh`
+- jar compatibility is checked against the final published artifact with `scripts/check_jar_compat.sh <final-jar-url>`
 - no root class exceeds Java 8 bytecode level
 - no root class references post-Java-8 sequenced collection APIs such as `java.util.SequencedCollection`
 
@@ -233,7 +233,7 @@ Add targeted one-off checks when relevant, for example:
 - generate a repro command with quotes and query parameters
 - run report aggregation on a temporary empty directory
 - run store discovery against a layout containing `store/suites/*`
-- run `bash scripts/check_jar_compat.sh <standalone-jar>` before publishing or updating a remote `JAR_URL`
+- run `bash scripts/check_jar_compat.sh <final-jar-url>` before updating a remote `JAR_URL` or launching a one-shot
 
 ## How to write review findings
 
