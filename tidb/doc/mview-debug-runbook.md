@@ -45,13 +45,13 @@ Do not start with `tcctl run` when a direct `none` Jepsen run is still failing i
 
 ## Gate standalone jars before remote `JAR_URL` runs
 
-When a `test-plan` or one-shot reproduction depends on a standalone Jepsen jar uploaded as `JAR_URL`, validate that jar before uploading it or changing the plan.
+When a `test-plan` or one-shot reproduction depends on a standalone Jepsen jar uploaded as `JAR_URL`, validate the final published artifact before changing the plan or submitting `tcctl run`.
 
 Run:
 
 ```bash
 cd tidb
-bash scripts/check_jar_compat.sh /path/to/jepsen-standalone.jar
+bash scripts/check_jar_compat.sh <final-jar-url>
 ```
 
 This check exists to catch the exact regression class we already hit in MView work:
@@ -60,6 +60,72 @@ This check exists to catch the exact regression class we already hit in MView wo
 - root classes that reference post-Java-8 sequenced collection APIs such as `java.util.SequencedCollection`
 
 Stop and fix the jar if this check fails. Do not continue to `tcctl run` just to rediscover a startup crash on the remote JVM.
+
+2026-04-03 recurrence:
+
+- the remote `JAR_URL` artifact was rebuilt with `Build-Jdk: 21`
+- the remote Jepsen control case `540371` still ran on `hub.pingcap.net/qa/jepsen-control-base:20220222`
+- the first case step failed immediately with `NoClassDefFoundError: java/util/SequencedCollection`
+
+The specific lesson is: checking only the local pre-upload jar is not enough. Always run the compatibility gate against the final published `JAR_URL` before updating `test-plan` or launching a one-shot.
+
+2026-04-03 follow-up:
+
+- the first compatibility rebuild fixed `java.util.SequencedCollection` by layering only `tidb/*` from the latest local standalone jar onto an older compatible base jar
+- remote runs still failed immediately with `java.lang.IllegalStateException: Attempting to call unbound fn: #'jepsen.net/prepare!`
+- root cause: the old compatible base jar also carried an outdated `jepsen/*` layer, and that layer did not define `jepsen.net/prepare!`
+
+Rules for future compatibility rebuilds:
+
+- if you must reuse an older compatible base jar to avoid Java 21 API leaks from dependency layers, do not replace only `tidb/*`
+- replace both `tidb/*` and `jepsen/*` from the current local standalone jar
+- after rebuilding, run a direct runtime probe before upload:
+
+```bash
+java -cp <rebuilt-jar> clojure.main -e "(require 'jepsen.net) (println :bound (bound? #'jepsen.net/prepare!)) (println :var (resolve 'jepsen.net/prepare!))"
+```
+
+- treat anything other than `:bound true` plus a resolved var as a hard stop
+- then run `bash scripts/check_jar_compat.sh <final-jar-url>` against the published object
+
+This is the current safe path for MView Jepsen jars:
+
+1. Start from the known-compatible base jar only to preserve the old dependency layer.
+2. Overlay both `tidb/*` and `jepsen/*` from the current local standalone jar.
+3. Probe `jepsen.net/prepare!` on the rebuilt jar.
+4. Upload to MinIO.
+5. Run the compatibility script against the final URL.
+6. Only then update `JAR_URL` in `test-plan` or submit a one-shot.
+
+## Setup timeout pattern: install `sync` stall
+
+If a case is reported as `TIMEOUT`, do not assume the workload body actually ran.
+
+For the 2026-04-03 MView Jepsen reruns, the real failure happened during DB setup:
+
+- the case `main.log` showed `tidb.db` entering install stage `:sync-start`
+- 4 nodes usually finished `:sync-done` within seconds
+- 1 node stayed in `:sync-start` until the setup barrier timed out
+- the top-level exception was:
+
+```text
+java.util.concurrent.TimeoutException
+  at jepsen.core/synchronize
+  at tidb.db ... setup!
+```
+
+- the case could auto-retry several times and hit the same node/stage repeatedly before the outer TCMS step was finally marked `TIMEOUT`
+
+What to check first:
+
+1. Read `main.log` and search for `:sync-start`, `:sync-done`, `:sync-timeout`, `:sync-error`, and `TimeoutException`.
+2. If one node stays at `:sync-start` while the others reach `:sync-done`, classify it as setup-stage sync stall, not workload timeout.
+3. Confirm whether the step never reached daemon startup by checking for missing `/opt/tidb/*.log` collection output.
+
+Current mitigation:
+
+- `install!` treats the disk `sync` step as best-effort with a bounded wait instead of a hard setup gate
+- if `sync` hangs on one node, log the timeout and continue setup instead of blocking the cluster-wide barrier
 
 ## Standard debug order
 
@@ -91,7 +157,7 @@ MAX_PARALLEL=3 WORKLOAD_FILTER=mv-lifecycle scripts/mview_parallel_suite_run_and
 
 Current default binary override pair for MView lines and debug runs:
 
-- `tidb:https://fileserver.pingcap.net/download/builds/devbuild/10260/tidb-linux-amd64.tar.gz`
+- `tidb:https://fileserver.pingcap.net/download/builds/devbuild/10265/tidb-linux-amd64.tar.gz`
 - `tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz`
 
 The repo wrappers, raw `lein run test`, and `run_jepsen.py` now default to this pair. Pass `--binary-urls` or `BINARY_URLS` explicitly only when you need to override it.
@@ -183,7 +249,7 @@ The resulting store must include:
 
 If the manifest is missing or malformed, fix that first. Otherwise later failures are hard to reproduce across threads.
 
-For remote one-shot or `test-plan` runs that also override `JAR_URL`, treat jar compatibility as part of the pinned build identity. A manifest alone is not enough if the uploaded standalone jar cannot start on the remote JVM.
+For remote one-shot or `test-plan` runs that also override `JAR_URL`, treat jar compatibility as part of the pinned build identity. A manifest alone is not enough if the uploaded standalone jar cannot start on the remote JVM. Record the exact compatibility check command and whether it was run against the final published URL.
 
 ## Artifact-first triage order
 
@@ -250,9 +316,24 @@ Do not treat missing container capabilities as a TiDB or workload regression.
 Rules:
 
 - `clock-skew` requires `SYS_TIME`; otherwise `/opt/jepsen/bump-time` fails with `settimeofday: Operation not permitted`
+- `clock-skew` is only trustworthy when each Jepsen workload node effectively has its own host clock; if two node pods share the same Kubernetes worker, `SYS_TIME` changes can couple those pods and make residual skew look like a product issue
+- the current `WORKLOAD_NODE` schema does not expose host-level anti-affinity or `topologySpreadConstraints`, so you cannot enforce one-pod-per-worker directly in today's `test-plan` or `jepsen-testbed.yaml`
+- for `clock-skew` reproductions, use a resource pool or environment where Jepsen workload pods can actually land on different workers, or get pod placement verified externally before treating residual skew as a product issue
+- if a rerun stays `PENDING` with no case-execution created, first check the target resource pool rather than the case: `tcctl get raw '/api/v1/resourcepool/<id>' -o -` and `tcctl get raw '/api/v1/plan-executions?resource_pool_id=<id>&count=20' -o -`
+- treat empty `idleResource` plus existing long-running Jepsen plans on the same pool as a scheduling bottleneck; on `benchbot`, `full-single-fault` runs can hold the pool for a long time and delay `manual-only`
+- do not misread a long `PENDING` rerun as "new case/new binary not applied"; if `plan-executions/<id>/plan` already shows the expected `JAR_URL`, binary URL, and `supportedVersions`, the rerun payload is already correct and only the pool is waiting
 - `partition` requires `NET_ADMIN`; otherwise iptables-based fault injection is not trustworthy
 - `scripts/mview_common.sh` defaults `JEPSEN_BEST_EFFORT_NET=1`, so `none` and other non-network faults can still run when real network shaping is unavailable
-- `tidb/jepsen-testbed.yaml` is the current bridge testbed template and requests both `SYS_TIME` and `NET_ADMIN` for direct debug runs
+- `tidb/jepsen-testbed.yaml` is the current bridge testbed template and requests both `SYS_TIME` and `NET_ADMIN`
+
+When direct pod placement is not visible because of cluster RBAC, treat these as strong co-location clues for `clock-skew` runs:
+
+- two logical Jepsen nodes keep the same large residual host offset after the final `reset-clock`
+- the same two nodes also keep the same large SQL `db-client-offset-ms`
+- `db-identity-summary.multi-node-backends = []`, so the SQL path is still node-local rather than shared-backend routing
+- the node IPs observed in the runner log fall into the same PodCIDR block, for example the same `/24`
+
+Do not classify that shape as a TiDB regression until you have ruled out worker-level clock coupling.
 
 When a run finishes but bridge cleanup cannot confirm namespace state because of cluster RBAC:
 
@@ -446,6 +527,22 @@ The `2026-03-25` fresh rerun of `mv-autosched-time + clock-skew` is the referenc
 - `anomalies = []`, `converged-snapshot-count = 35`, and the quiet window was about `39s`
 
 That rerun matters because it weakens the old `8060108` "shared backend" theory. With fresh per-node backend identity and no large post-reset SQL skew, the old failure looks more like a run-specific time-source or residual-skew issue than a stable node-label routing bug.
+
+`8112524` on `2026-04-03` is the complementary failure example to remember:
+
+- `db-identity-summary.distinct-backend-count = 5`
+- `db-identity-summary.multi-node-backends = []`
+- final host offsets were about `-97ms`, `-98ms`, `+63143ms`, `-98ms`, `+63142ms`
+- final SQL `db-client-offset-ms` values were about `-2ms`, `-3ms`, `+63236ms`, `-2ms`, `+63236ms`
+- the host-vs-SQL deltas still stayed near `93-96ms`, so SQL time matched the host skew on the bad nodes instead of diverging from it
+- the skewed nodes were `node-2` and `node-4` in both the final `history.edn` `:reset-clock` offsets and the quiet-phase `mv-autosched-time/snapshots.json`
+
+That pattern is not a routing or shared-backend story:
+
+- classify it as a host reset failure first, because the final nemesis-visible host offsets already stayed around `+63s`
+- do not spend time on `db-identity-summary` routing hypotheses when `multi-node-backends = []` and the skewed SQL backends remain node-local
+- the next artifact to inspect is the skewed nodes' local component logs, not the snapshot routing map
+- in `8112524`, `node-2` and `node-4` `pd.log` both showed repeated `system time jump backward` / `incorrect system time` during the same window, which matched the residual `+63s` host and SQL offsets
 
 When `mv-autosched-time` is invalid and the last snapshots already tell you `row-equal? = true` but `agg-equal? = false`, check the component liveness gap in `runtime-metadata.rows` before jumping to a routing explanation:
 

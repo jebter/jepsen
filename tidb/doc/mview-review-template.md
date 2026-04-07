@@ -64,7 +64,7 @@ Check:
 - Are branch-build fields fully pinned in the manifest?
 - Is `repro_command` copy/paste-safe for quotes, spaces, JSON, and URLs?
 - Do wrapper scripts safely pass tarball URLs, binary URLs, and feature flags?
-- If a remote `JAR_URL` is involved, was `bash scripts/check_jar_compat.sh <standalone-jar>` run before upload?
+- If a remote `JAR_URL` is involved, was `bash scripts/check_jar_compat.sh <final-jar-url>` run against the final published artifact before plan update or one-shot submission?
 
 Notes:
 
@@ -153,7 +153,7 @@ LEIN_HOME=/tmp/.lein /tmp/lein test
 python3 -m py_compile run_jepsen.py scripts/mview_report_common.py scripts/mview_store_report.py scripts/mview_suite_report.py
 bash -n scripts/mview_common.sh scripts/mview_run_and_report.sh scripts/mview_suite_run_and_report.sh
 git diff --check
-bash scripts/check_jar_compat.sh <standalone-jar>
+bash scripts/check_jar_compat.sh <final-jar-url>
 ```
 
 ## Findings
