@@ -44,6 +44,38 @@
             :agg-hash agg-hash
             :log-row-count log-row-count}})
 
+(defn time-snapshot-op-with-runtime
+  [snapshot-at-ms snapshot-node row-equal? agg-equal? row-hash agg-hash log-row-count db-now-ms runtime-metadata]
+  (cond-> (time-snapshot-op snapshot-at-ms
+                            snapshot-node
+                            row-equal?
+                            agg-equal?
+                            row-hash
+                            agg-hash
+                            log-row-count)
+    (some? db-now-ms) (assoc-in [:result :db-now-ms] db-now-ms)
+    runtime-metadata (assoc-in [:result :runtime-metadata] runtime-metadata)))
+
+(defn purge-runtime-metadata
+  [next-time-ms end-time-ms]
+  {:available? true
+   :source :system-tables
+   :match-count 3
+   :rows [{:component :row-refresh
+           :next-time-ms 5000
+           :last-success-read-tso 10}
+          {:component :agg-refresh
+           :next-time-ms 7000
+           :last-success-read-tso 20}
+          {:component :log-purge
+           :next-time-ms next-time-ms
+           :last-purged-tso 30}]
+   :recent-history [{:component :log-purge
+                     :job-id 6
+                     :status "SUCCESS"
+                     :end-time-ms end-time-ms
+                     :row-count 6}]})
+
 (defn schedule-snapshot
   [snapshot-at-ms snapshot-node component entry]
   {:snapshot-at-ms snapshot-at-ms
@@ -1547,6 +1579,103 @@
     (is (= 2 (:ignored-pre-reset-snapshot-count summary)))
     (is (contains? anomaly-kinds :no-post-reset-convergence))
     (is (contains? anomaly-kinds :no-post-reset-stability))))
+
+(deftest autosched-time-check-warns-when-purge-next-time-is-still-in-the-future
+  (let [history [{:type :info
+                  :f :bump-clock
+                  :clock-offsets {"n1" 3.0}}
+                 {:type :info
+                  :f :reset-clock
+                  :clock-offsets {"n1" 0.0}}
+                 (time-snapshot-op-with-runtime 0
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                1000
+                                                (purge-runtime-metadata 70000 65000))
+                 (time-snapshot-op-with-runtime 20000
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                20000
+                                                (purge-runtime-metadata 70000 65000))
+                 (time-snapshot-op-with-runtime 40000
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                40000
+                                                (purge-runtime-metadata 70000 69000))]
+        summary (checker/check (autosched-time/checker*)
+                               {:nemesis-spec {:clock-skew true}}
+                               history
+                               nil)
+        anomaly-kinds (set (map :kind (:anomalies summary)))
+        warnings-by-kind (into {}
+                               (map (juxt :kind identity))
+                               (:warnings summary))]
+    (is (true? (:valid? summary)))
+    (is (= false (:purge-progress summary)))
+    (is (not (contains? anomaly-kinds :purge-not-progressing)))
+    (is (contains? warnings-by-kind :purge-delayed-by-future-next-time))
+    (is (= 30000
+           (get-in warnings-by-kind
+                   [:purge-delayed-by-future-next-time :details :purge-next-time :next-time-in-ms])))))
+
+(deftest autosched-time-check-still-fails-when-purge-should-already-be-due
+  (let [history [{:type :info
+                  :f :bump-clock
+                  :clock-offsets {"n1" 3.0}}
+                 {:type :info
+                  :f :reset-clock
+                  :clock-offsets {"n1" 0.0}}
+                 (time-snapshot-op-with-runtime 0
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                1000
+                                                (purge-runtime-metadata 35000 30000))
+                 (time-snapshot-op-with-runtime 20000
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                20000
+                                                (purge-runtime-metadata 35000 30000))
+                 (time-snapshot-op-with-runtime 40000
+                                                "n1"
+                                                true
+                                                true
+                                                1
+                                                1
+                                                5
+                                                40000
+                                                (purge-runtime-metadata 35000 30000))]
+        summary (checker/check (autosched-time/checker*)
+                               {:nemesis-spec {:clock-skew true}}
+                               history
+                               nil)
+        anomaly-kinds (set (map :kind (:anomalies summary)))
+        warnings-by-kind (into {}
+                               (map (juxt :kind identity))
+                               (:warnings summary))]
+    (is (false? (:valid? summary)))
+    (is (= false (:purge-progress summary)))
+    (is (contains? anomaly-kinds :purge-not-progressing))
+    (is (not (contains? warnings-by-kind :purge-delayed-by-future-next-time)))))
 
 (deftest autosched-time-check-classifies-clock-skew-capability-gaps
   (let [history [{:type :info
