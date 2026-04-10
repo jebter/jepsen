@@ -155,12 +155,13 @@ WORKLOAD_FILTER=mv-lifecycle scripts/mview_suite_run_and_report.sh full-single-f
 MAX_PARALLEL=3 WORKLOAD_FILTER=mv-lifecycle scripts/mview_parallel_suite_run_and_report.sh full-single-fault <tarball-url> <binary-urls>
 ```
 
-Current default binary override pair for MView lines and debug runs:
+Current default binary override set for MView lines and debug runs:
 
-- `tidb:https://fileserver.pingcap.net/download/builds/devbuild/10265/tidb-linux-amd64.tar.gz`
+- `tidb:https://fileserver.pingcap.net/download/builds/hotfix/tidb/v8.5.4-20260409-967ae37/10274/tidb-patch-linux-amd64.tar.gz`
 - `tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz`
+- `pd:https://fileserver.pingcap.net/download/builds/hotfix/pd/v8.5.4-20260409-39dcf2c/10276/pd-patch-linux-amd64.tar.gz`
 
-The repo wrappers, raw `lein run test`, and `run_jepsen.py` now default to this pair. Pass `--binary-urls` or `BINARY_URLS` explicitly only when you need to override it.
+The repo wrappers, raw `lein run test`, and `run_jepsen.py` now default to this set. Pass `--binary-urls` or `BINARY_URLS` explicitly only when you need to override it.
 
 ## Bridge-backed direct runs
 
@@ -699,14 +700,14 @@ Treat the run as reproducing the core product bug when all of these hold:
 - on one node's snapshot table, `row-refresh.next-time-ms` keeps stepping forward while `agg-refresh.next-time-ms` stays pinned to one future timestamp
 - `row-refresh.last-success-read-tso` keeps advancing while `agg-refresh.last-success-read-tso` stays frozen
 
-If `log-purge.last-purged-tso` also stays equal to the stale aggregate TSO and `log-row-count` stays flat, that strengthens the same bug as a downstream purge symptom. `:purge-not-progressing` is helpful but not required to establish the core scheduler future-pin failure.
+If `log-purge.last-purged-tso` also stays equal to the stale aggregate TSO and `log-row-count` stays flat, that strengthens the same bug as a downstream purge symptom. `:purge-not-progressing` is helpful but not required to establish the core scheduler future-pin failure. If `log-purge.next-time-ms` is still ahead of `db-now-ms`, expect warning `:purge-delayed-by-future-next-time` instead of treating that quiet-phase sample as a hard purge failure.
 
 When choosing an external duplicate anchor, the nearest current open issue is `#66843` in `references/known_issues.md`: automatic refresh can stall after a DST fall-back time shift. Use it only as the closest scheduler time-boundary reference, not as an exact duplicate, because the trigger here is Jepsen `clock-skew` / reset rather than a DST transition.
 
 Interpret `manual_only` carefully:
 
 - `manual_only` means excluded from default suites, not a soft-pass or expected red state
-- for `mv-autosched-time` with `clock-skew`, hard anomalies such as `:residual-clock-skew`, `:no-post-reset-convergence`, `:no-post-reset-stability`, and `:purge-not-progressing` are real failures under the current checker contract
+- for `mv-autosched-time` with `clock-skew`, hard anomalies such as `:residual-clock-skew`, `:no-post-reset-convergence`, and `:no-post-reset-stability` are real failures under the current checker contract; `:purge-not-progressing` is only hard when the latest `log-purge.next-time-ms` should already be due or runtime metadata cannot explain the stall
 - only downgrade the result to a suite-policy note when the failure reason is about promotion or catalog eligibility, not when the checker emits hard anomalies
 
 Classify the failure before changing code:

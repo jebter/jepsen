@@ -229,6 +229,56 @@
       (zero? (last counts)) :empty
       :else false)))
 
+(defn- component-runtime-entry
+  [snapshot component]
+  (let [metadata (or (:runtime-metadata snapshot)
+                     (:timer-metadata snapshot))]
+    (some (fn [row]
+            (when (= component (:component row))
+              row))
+          (:rows metadata))))
+
+(defn- component-history-entry
+  [snapshot component]
+  (some (fn [row]
+          (when (= component (:component row))
+            row))
+        (get-in snapshot [:runtime-metadata :recent-history])))
+
+(defn- purge-next-time-state
+  [snapshot]
+  (when-let [runtime-row (component-runtime-entry snapshot :log-purge)]
+    (when-let [next-time-ms (:next-time-ms runtime-row)]
+      (let [observed-now-ms (or (:db-now-ms snapshot)
+                                (:snapshot-at-ms snapshot))
+            history-entry   (component-history-entry snapshot :log-purge)]
+        (cond-> {:snapshot-at-ms  (:snapshot-at-ms snapshot)
+                 :snapshot-node   (:snapshot-node snapshot)
+                 :observed-now-ms observed-now-ms
+                 :db-now-ms       (:db-now-ms snapshot)
+                 :next-time-ms    next-time-ms
+                 :next-time-in-ms (- next-time-ms observed-now-ms)}
+          history-entry
+          (assoc :recent-history
+                 (select-keys history-entry
+                              [:job-id
+                               :status
+                               :start-time-ms
+                               :end-time-ms
+                               :row-count
+                               :failed-reason])))))))
+
+(defn- stuck-purge?
+  [summary]
+  (and (= false (:purge-progress summary))
+       (>= (:quiet-window-ms summary) (purge-budget-ms))))
+
+(defn- future-purge-next-time?
+  [summary]
+  (let [next-time-in-ms (get-in summary [:purge-next-time :next-time-in-ms])]
+    (and (number? next-time-in-ms)
+         (pos? next-time-in-ms))))
+
 (def schedule-components
   {:row-refresh "row refresh"
    :agg-refresh "agg refresh"
@@ -679,6 +729,7 @@
      :row-agg-change-count     row-agg-change-count
      :signature-change-count   signature-change-count
      :purge-progress           purge-state
+     :purge-next-time          (some-> snapshots last purge-next-time-state)
      :regression-events        regression
      :last-snapshot            (last snapshots)}))
 
@@ -737,9 +788,12 @@
         slow-stability             (first-node-match node-analysis
                                                     #(and (some? (:first-stable-lag-ms %))
                                                           (> (:first-stable-lag-ms %) (stability-budget-ms))))
+        delayed-purge              (first-node-match node-analysis
+                                                    #(and (stuck-purge? %)
+                                                          (future-purge-next-time? %)))
         stuck-purge                (first-node-match node-analysis
-                                                    #(and (= false (:purge-progress %))
-                                                          (>= (:quiet-window-ms %) (purge-budget-ms))))
+                                                    #(and (stuck-purge? %)
+                                                          (not (future-purge-next-time? %))))
         regressed-node             (first-node-match node-analysis #(seq (:regression-events %)))
         churned-row-agg            (first-node-match node-analysis
                                                     #(> (:row-agg-change-count %) quiet-row-agg-change-budget))
@@ -783,6 +837,16 @@
                      {:node node
                       :lag-ms (:first-stable-lag-ms summary)
                       :budget-ms (stability-budget-ms)})))
+        delayed-purge-warning
+        (when (and requested? delayed-purge)
+          (let [[node summary] delayed-purge]
+            (anomaly :purge-delayed-by-future-next-time
+                     :warning
+                     "MLog purge had no visible progress, but the latest NEXT_TIME was still in the future"
+                     {:node node
+                      :budget-ms (purge-budget-ms)
+                      :observed-window-ms (:quiet-window-ms summary)
+                      :purge-next-time (:purge-next-time summary)})))
         stuck-purge-anomaly
         (when (and requested? stuck-purge)
           (let [[node summary] stuck-purge]
@@ -791,7 +855,8 @@
                      "MLog purge did not visibly progress within the purge budget"
                      {:node node
                       :budget-ms (purge-budget-ms)
-                      :observed-window-ms (:quiet-window-ms summary)})))
+                      :observed-window-ms (:quiet-window-ms summary)
+                      :purge-next-time (:purge-next-time summary)})))
         regressed-node-anomaly
         (when (and requested? regressed-node)
           (let [[node summary] regressed-node]
@@ -943,6 +1008,9 @@
                                      schedule-metadata-disappeared-anomaly
                                      (conj schedule-metadata-disappeared-anomaly))
         warnings                   (cond-> []
+                                     delayed-purge-warning
+                                     (conj delayed-purge-warning)
+
                                      row-agg-churn-warning
                                      (conj row-agg-churn-warning)
 

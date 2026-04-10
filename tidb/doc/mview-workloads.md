@@ -99,6 +99,7 @@ Current checker contract:
 - require at least one real skew injection (`bump-clock` or `strobe-clock`) when `clock-skew` is requested
 - require a successful `reset-clock` before the quiet-phase oracle is considered valid
 - fail when post-reset convergence or post-reset stability exceeds the configured quiet-phase budgets
+- only fail `:purge-not-progressing` when quiet-phase runtime metadata says log purge should already be due, or when telemetry cannot explain the stall; if `log-purge.next-time-ms` is still in the future, downgrade that signal to warning `:purge-delayed-by-future-next-time`
 - fail when DB wall clock still diverges materially from the client after reset
 - warn when quiet-phase churn is higher than expected, to flag possible duplicate scheduling / `next_time` anomalies
 

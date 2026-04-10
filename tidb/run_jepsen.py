@@ -10,10 +10,12 @@ from collections import OrderedDict
 import mview_case_catalog
 
 DEFAULT_BINARY_URLS = (
-    "tidb:https://fileserver.pingcap.net/download/builds/devbuild/"
-    "10265/tidb-linux-amd64.tar.gz,"
+    "tidb:https://fileserver.pingcap.net/download/builds/hotfix/tidb/"
+    "v8.5.4-20260409-967ae37/10274/tidb-patch-linux-amd64.tar.gz,"
     "tikv:https://fileserver.pingcap.net/download/builds/hotfix/tikv/"
-    "v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz"
+    "v8.5.4-20260316-c69cb9b/10004/tikv-patch-linux-amd64.tar.gz,"
+    "pd:https://fileserver.pingcap.net/download/builds/hotfix/pd/"
+    "v8.5.4-20260409-39dcf2c/10276/pd-patch-linux-amd64.tar.gz"
 )
 
 
