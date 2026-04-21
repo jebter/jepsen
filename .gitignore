@@ -31,3 +31,24 @@ bench/**
 .idea
 *.iml
 jepsen/doc
+
+# Local macOS / desktop noise
+.DS_Store
+
+# Local cluster and testbed state
+.kube/
+.env
+kubeconfig.yml
+output
+
+# Local TiDB debug state
+tidb/.env
+tidb/.env*.bak
+tidb/kubeconfig.yml
+tidb/kubeconfig*.bak
+tidb/kubeconfig.yml.stale-before-tcctl-*
+tidb/output
+tidb/output*.bak
+
+# Local Codex scratch workspace
+.codex-mv-autosched-manual/
