@@ -20,8 +20,8 @@ usage:
 create:
   Creates a fresh tcctl testbed in workdir, extracts a Jepsen SSH private key
   from kubeconfig.yml, injects the matching public key into every node's
-  authorized_keys, starts localhost SQL port-forwards for every node, and
-  prints shell assignments for the resulting bridge data.
+  authorized_keys, starts localhost SQL and SSH port-forwards for every node,
+  and prints shell assignments for the resulting bridge data.
 
 cleanup:
   Deletes only the testbed described by <workdir>/output and stops only the
@@ -133,15 +133,39 @@ node_fqdn() {
   printf 'node-%s.node-peer.%s.svc.cluster.local\n' "$index" "$testbed"
 }
 
+tunnel_pid_file() {
+  local workdir="$1"
+  local tunnel_kind="$2"
+  printf '%s/%s-port-forward.pids\n' "$workdir" "$tunnel_kind"
+}
+
+tunnel_log_file() {
+  local workdir="$1"
+  local tunnel_kind="$2"
+  local index="$3"
+  printf '%s/%s-port-forward-node-%s.log\n' "$workdir" "$tunnel_kind" "$index"
+}
+
 sql_tunnel_pid_file() {
   local workdir="$1"
-  printf '%s/sql-port-forward.pids\n' "$workdir"
+  tunnel_pid_file "$workdir" sql
 }
 
 sql_tunnel_log_file() {
   local workdir="$1"
   local index="$2"
-  printf '%s/sql-port-forward-node-%s.log\n' "$workdir" "$index"
+  tunnel_log_file "$workdir" sql "$index"
+}
+
+ssh_tunnel_pid_file() {
+  local workdir="$1"
+  tunnel_pid_file "$workdir" ssh
+}
+
+ssh_tunnel_log_file() {
+  local workdir="$1"
+  local index="$2"
+  tunnel_log_file "$workdir" ssh "$index"
 }
 
 find_free_local_port() {
@@ -158,11 +182,12 @@ PY
 wait_for_port_forward() {
   local pid="$1"
   local port="$2"
-  local log_file="$3"
+  local remote_port="$3"
+  local log_file="$4"
   local attempt=0
 
   for ((attempt = 0; attempt < 80; attempt++)); do
-    if grep -Eq "Forwarding from (127\\.0\\.0\\.1|\\[::1\\]):${port} -> 4000" "$log_file" 2>/dev/null; then
+    if grep -Eq "Forwarding from (127\\.0\\.0\\.1|\\[::1\\]):${port} -> ${remote_port}" "$log_file" 2>/dev/null; then
       return 0
     fi
 
@@ -178,12 +203,13 @@ wait_for_port_forward() {
   return 1
 }
 
-cleanup_sql_tunnels() {
+cleanup_tunnels() {
   local workdir="$1"
+  local tunnel_kind="$2"
   local pid_file=""
   local pid=""
 
-  pid_file="$(sql_tunnel_pid_file "$workdir")"
+  pid_file="$(tunnel_pid_file "$workdir" "$tunnel_kind")"
   [[ -f "$pid_file" ]] || return 0
 
   while IFS= read -r pid; do
@@ -200,6 +226,16 @@ cleanup_sql_tunnels() {
       sleep 0.1
     done
   done <"$pid_file"
+}
+
+cleanup_sql_tunnels() {
+  local workdir="$1"
+  cleanup_tunnels "$workdir" sql
+}
+
+cleanup_ssh_tunnels() {
+  local workdir="$1"
+  cleanup_tunnels "$workdir" ssh
 }
 
 json_map_from_pairs() {
@@ -232,11 +268,13 @@ print(proc.pid)
 PY
 }
 
-start_sql_tunnels() {
+start_tunnels() {
   local workdir="$1"
   local kubeconfig="$2"
   local namespace="$3"
   local replicas="$4"
+  local tunnel_kind="$5"
+  local remote_port="$6"
   local pid_file=""
   local mappings=()
   local index=0
@@ -245,13 +283,13 @@ start_sql_tunnels() {
   local fqdn=""
   local log_file=""
 
-  pid_file="$(sql_tunnel_pid_file "$workdir")"
+  pid_file="$(tunnel_pid_file "$workdir" "$tunnel_kind")"
   : >"$pid_file"
 
   for ((index = 0; index < replicas; index++)); do
     fqdn="$(node_fqdn "$namespace" "$index")"
     port="$(find_free_local_port)"
-    log_file="$(sql_tunnel_log_file "$workdir" "$index")"
+    log_file="$(tunnel_log_file "$workdir" "$tunnel_kind" "$index")"
     : >"$log_file"
 
     pid="$(start_detached_process bash -c '
@@ -261,6 +299,8 @@ start_sql_tunnels() {
       index="$3"
       port="$4"
       log_file="$5"
+      tunnel_kind="$6"
+      remote_port="$7"
       child_pid=""
 
       cleanup() {
@@ -274,23 +314,23 @@ start_sql_tunnels() {
       trap cleanup TERM INT EXIT
 
       while true; do
-        printf "[restart %s] starting port-forward node-%s %s\n" \
-          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$index" "$port" >>"$log_file"
+        printf "[restart %s] starting %s port-forward node-%s %s -> %s\n" \
+          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$tunnel_kind" "$index" "$port" "$remote_port" >>"$log_file"
         env KUBECONFIG="$kubeconfig" kubectl port-forward -n "$namespace" "pod/node-$index" \
-          "$port:4000" >>"$log_file" 2>&1 &
+          "$port:$remote_port" >>"$log_file" 2>&1 &
         child_pid=$!
         wait "$child_pid" >/dev/null 2>&1 || true
         child_pid=""
-        printf "[restart %s] port-forward node-%s exited\n" \
-          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$index" >>"$log_file"
+        printf "[restart %s] %s port-forward node-%s exited\n" \
+          "$(date +%Y-%m-%dT%H:%M:%S%z)" "$tunnel_kind" "$index" >>"$log_file"
         sleep 0.2
       done
-    ' bash "$kubeconfig" "$namespace" "$index" "$port" "$log_file")"
+    ' bash "$kubeconfig" "$namespace" "$index" "$port" "$log_file" "$tunnel_kind" "$remote_port")"
     printf '%s\n' "$pid" >>"$pid_file"
 
-    if ! wait_for_port_forward "$pid" "$port" "$log_file"; then
-      cleanup_sql_tunnels "$workdir"
-      echo "failed to start SQL tunnel for $fqdn" >&2
+    if ! wait_for_port_forward "$pid" "$port" "$remote_port" "$log_file"; then
+      cleanup_tunnels "$workdir" "$tunnel_kind"
+      echo "failed to start $tunnel_kind tunnel for $fqdn" >&2
       return 1
     fi
 
@@ -298,6 +338,22 @@ start_sql_tunnels() {
   done
 
   json_map_from_pairs "${mappings[@]}"
+}
+
+start_sql_tunnels() {
+  local workdir="$1"
+  local kubeconfig="$2"
+  local namespace="$3"
+  local replicas="$4"
+  start_tunnels "$workdir" "$kubeconfig" "$namespace" "$replicas" sql 4000
+}
+
+start_ssh_tunnels() {
+  local workdir="$1"
+  local kubeconfig="$2"
+  local namespace="$3"
+  local replicas="$4"
+  start_tunnels "$workdir" "$kubeconfig" "$namespace" "$replicas" ssh 22
 }
 
 bootstrap_authorized_keys() {
@@ -501,6 +557,7 @@ create_bridge_file() {
   local http_proxy="$5"
   local nodes="$6"
   local sql_tunnel_ports="$7"
+  local ssh_tunnel_ports="$8"
   cat >"$workdir/bridge.env.sh" <<EOF
 export MVIEW_TESTBED_WORKDIR='$workdir'
 export TESTBED='$testbed'
@@ -513,6 +570,7 @@ export JEPSEN_SSH_PROXY='$http_proxy'
 export NODES='$nodes'
 export JEPSEN_NODES='$nodes'
 export JEPSEN_SQL_TUNNEL_PORTS='$sql_tunnel_ports'
+export JEPSEN_SSH_TUNNEL_PORTS='$ssh_tunnel_ports'
 EOF
 }
 
@@ -529,6 +587,7 @@ create_testbed() {
   local http_proxy=""
   local nodes=""
   local sql_tunnel_ports=""
+  local ssh_tunnel_ports=""
 
   if [[ -z "$workdir" ]]; then
     workdir="$(mktemp -d /tmp/mview-testbed-XXXXXX)"
@@ -551,8 +610,15 @@ create_testbed() {
   public_key="$(ssh-keygen -y -f "$private_key")"
   bootstrap_authorized_keys "$kubeconfig" "$testbed" "$replicas" "$public_key"
   nodes="$(node_fqdn_csv "$testbed" "$replicas")"
-  sql_tunnel_ports="$(start_sql_tunnels "$workdir" "$kubeconfig" "$testbed" "$replicas")"
-  create_bridge_file "$workdir" "$testbed" "$kubeconfig" "$private_key" "$http_proxy" "$nodes" "$sql_tunnel_ports"
+  if ! sql_tunnel_ports="$(start_sql_tunnels "$workdir" "$kubeconfig" "$testbed" "$replicas")"; then
+    cleanup_testbed "$workdir"
+    return 1
+  fi
+  if ! ssh_tunnel_ports="$(start_ssh_tunnels "$workdir" "$kubeconfig" "$testbed" "$replicas")"; then
+    cleanup_testbed "$workdir"
+    return 1
+  fi
+  create_bridge_file "$workdir" "$testbed" "$kubeconfig" "$private_key" "$http_proxy" "$nodes" "$sql_tunnel_ports" "$ssh_tunnel_ports"
 
   cat <<EOF
 MVIEW_TESTBED_WORKDIR=$workdir
@@ -566,6 +632,7 @@ JEPSEN_SSH_PROXY=$http_proxy
 NODES=$nodes
 JEPSEN_NODES=$nodes
 JEPSEN_SQL_TUNNEL_PORTS=$sql_tunnel_ports
+JEPSEN_SSH_TUNNEL_PORTS=$ssh_tunnel_ports
 BRIDGE_ENV=$workdir/bridge.env.sh
 EOF
 }
@@ -598,6 +665,7 @@ cleanup_testbed() {
 
   testbed="$(read_testbed_field "$output_file" name)"
   cleanup_sql_tunnels "$workdir"
+  cleanup_ssh_tunnels "$workdir"
 
   set +e
   delete_output="$(cd "$workdir" && tcctl testbed delete -f output 2>&1)"

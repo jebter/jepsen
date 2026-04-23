@@ -78,3 +78,21 @@
               (JSchException. "channel is not opened."))))
   (is (false? (#'c/retryable-jsch-exception?
                (JSchException. "Auth fail")))))
+
+(deftest parse-port-map-test
+  (is (= {"node-a" 2201
+          "node-b" 2202}
+         (#'c/parse-port-map "{\"node-a\":2201,\"node-b\":2202}")))
+  (is (nil? (#'c/parse-port-map "{bad json"))))
+
+(deftest ssh-target-prefers-local-bridge-tunnel
+  (with-redefs [c/ssh-tunnel-port-map (constantly {"node-a" 2201})]
+    (c/with-ssh {:port 22}
+      (is (= {:host "127.0.0.1"
+              :port 2201
+              :proxy? false}
+             (#'c/ssh-target "node-a")))
+      (is (= {:host "node-b"
+              :port 22
+              :proxy? true}
+             (#'c/ssh-target "node-b"))))))

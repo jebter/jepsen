@@ -702,7 +702,15 @@ Treat the run as reproducing the core product bug when all of these hold:
 
 If `log-purge.last-purged-tso` also stays equal to the stale aggregate TSO and `log-row-count` stays flat, that strengthens the same bug as a downstream purge symptom. `:purge-not-progressing` is helpful but not required to establish the core scheduler future-pin failure. If `log-purge.next-time-ms` is still ahead of `db-now-ms`, expect warning `:purge-delayed-by-future-next-time` instead of treating that quiet-phase sample as a hard purge failure.
 
-When choosing an external duplicate anchor, the nearest current open issue is `#66843` in `references/known_issues.md`: automatic refresh can stall after a DST fall-back time shift. Use it only as the closest scheduler time-boundary reference, not as an exact duplicate, because the trigger here is Jepsen `clock-skew` / reset rather than a DST transition.
+Do not use `mysql.tidb_mview_refresh_hist.refresh_time` or `endtime` alone to prove that refresh or purge never ran. Those wall-clock fields can be dirtied by the reset itself, and `#66849` means the history tables may miss records even when work actually executed. Prefer the quiet-phase `next-time-ms`, `last-success-read-tso`, `last-purged-tso`, and TSO-decoded physical time when deciding whether this bucket reproduced.
+
+Current root-cause summary for this bucket:
+
+- automatic refresh and purge persist an absolute `NEXT_TIME` computed from local `NOW() + interval`
+- after a backward wall-clock reset, `MVService` only compares the stored absolute `NEXT_TIME` against current wall clock; it does not rebase, clamp, or catch up the schedule
+- the quiet-window signature is therefore a future-pinned `next-time-ms` plus flat `LAST_SUCCESS_READ_TSO` / `LAST_PURGED_TSO` until wall clock reaches the pinned timestamp
+
+When choosing an external anchor, use `#66843` in `references/known_issues.md` for the underlying scheduler time-boundary stall and `#67671` for the missing operator-facing diagnostics around future-pinned `NEXT_TIME`. Treat `#66843` as the closest open bug, not as an exact duplicate, unless the trigger is literally a DST fall-back rather than a Jepsen `clock-skew` backward reset.
 
 Interpret `manual_only` carefully:
 
