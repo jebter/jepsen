@@ -12,6 +12,41 @@ BRIDGE = ROOT / "scripts" / "mview_testbed_bridge.sh"
 
 
 class MViewTestbedBridgeRetryTest(unittest.TestCase):
+    def test_create_bridge_file_exports_ssh_tunnel_ports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workdir = root / "workdir"
+            bridge_copy = root / "bridge.sh"
+
+            workdir.mkdir(parents=True)
+            bridge_copy.write_text(
+                BRIDGE.read_text(encoding="utf-8").replace('main "$@"', ': # main disabled for unit tests\n', 1),
+                encoding="utf-8",
+            )
+
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    (
+                        f"source {shlex.quote(str(bridge_copy))}; "
+                        f"create_bridge_file {shlex.quote(str(workdir))} stub-testbed "
+                        f"/tmp/kubeconfig.yml /tmp/jepsen.pem socks5://proxy.example.com:1080 "
+                        f"node-0,node-1 "
+                        f"'{{\"node-0\":4000}}' "
+                        f"'{{\"node-0\":2200}}'; "
+                        f"cat {shlex.quote(str(workdir / 'bridge.env.sh'))}"
+                    ),
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            self.assertIn("export JEPSEN_SQL_TUNNEL_PORTS='{\"node-0\":4000}'", proc.stdout)
+            self.assertIn("export JEPSEN_SSH_TUNNEL_PORTS='{\"node-0\":2200}'", proc.stdout)
+
     def test_create_tcctl_testbed_retries_quota_limit_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -256,6 +291,69 @@ class MViewTestbedBridgeRetryTest(unittest.TestCase):
 
             self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
             self.assertIn("cleanup confirmed for testbed stub-testbed via tcctl", proc.stderr)
+
+    def test_create_testbed_cleans_up_when_ssh_tunnel_setup_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workdir = root / "workdir"
+            cleanup_marker = root / "cleanup.txt"
+            bridge_copy = root / "bridge.sh"
+
+            workdir.mkdir(parents=True)
+            bridge_copy.write_text(
+                BRIDGE.read_text(encoding="utf-8").replace('main "$@"', ': # main disabled for unit tests\n', 1),
+                encoding="utf-8",
+            )
+
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    textwrap.dedent(
+                        f"""\
+                        source {shlex.quote(str(bridge_copy))}
+                        create_tcctl_testbed() {{
+                          local workdir="$1"
+                          cat >"$workdir/output" <<'EOF'
+                        {{"name":"stub-testbed","items":[{{"name":"node","details":{{"spec":{{"replicas":1}}}}}}]}}
+                        EOF
+                          cat >"$workdir/.env" <<'EOF'
+                        HTTP_PROXY: socks5://proxy.example.com:1080
+                        EOF
+                        }}
+                        extract_private_key() {{
+                          printf 'private-key\\n' >"$2"
+                          chmod 600 "$2"
+                        }}
+                        bootstrap_authorized_keys() {{
+                          :
+                        }}
+                        ssh-keygen() {{
+                          printf 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDstubkey\\n'
+                        }}
+                        start_sql_tunnels() {{
+                          printf '{{"node-0.node-peer.stub-testbed.svc.cluster.local":4000}}'
+                        }}
+                        start_ssh_tunnels() {{
+                          echo "simulated ssh tunnel failure" >&2
+                          return 1
+                        }}
+                        cleanup_testbed() {{
+                          printf '%s\\n' "$1" > {shlex.quote(str(cleanup_marker))}
+                          return 0
+                        }}
+                        create_testbed {shlex.quote(str(workdir))} dummy-spec
+                        """
+                    ),
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            self.assertIn("simulated ssh tunnel failure", proc.stderr)
+            self.assertEqual(str(workdir), cleanup_marker.read_text(encoding="utf-8").strip())
 
 
 if __name__ == "__main__":

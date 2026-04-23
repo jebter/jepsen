@@ -334,10 +334,48 @@
           {:host host
            :port port})))))
 
+(defn- parse-port-map
+  [raw]
+  (when (seq raw)
+    (try
+      (let [trimmed (str/trim raw)]
+        (cond
+          (= "{}" trimmed)
+          {}
+
+          (re-matches #"\{\s*\"[^\"]+\"\s*:\s*[0-9]+\s*(,\s*\"[^\"]+\"\s*:\s*[0-9]+\s*)*\}" trimmed)
+          (->> (re-seq #"\"([^\"]+)\"\s*:\s*([0-9]+)" trimmed)
+               (reduce (fn [port-map [_ host port]]
+                         (assoc port-map host (Long/parseLong port)))
+                       {}))
+
+          :else
+          (throw (RuntimeException. "invalid port map syntax"))))
+      (catch Exception e
+        (warn (str "Ignoring invalid JEPSEN_SSH_TUNNEL_PORTS: "
+                   (.getMessage e)))
+        nil))))
+
+(defn- ssh-tunnel-port-map
+  []
+  (some-> (System/getenv "JEPSEN_SSH_TUNNEL_PORTS")
+          parse-port-map))
+
+(defn- ssh-target
+  [host]
+  (if-let [tunnel-port (get (ssh-tunnel-port-map) host)]
+    {:host "127.0.0.1"
+     :port tunnel-port
+     :proxy? false}
+    {:host host
+     :port *port*
+     :proxy? true}))
+
 (defn clj-ssh-session
   "Opens a raw session to the given host."
   [host]
   (let [host    (check-name host)
+        {:keys [host port proxy?]} (ssh-target host)
         agent   (JSch.)
         _       (when *private-key-path*
                   ; clj-ssh's identity wrapper can reject keys JSch itself loads
@@ -349,9 +387,10 @@
                              host
                              {:username *username*
                               :password *password*
-                              :port *port*
+                              :port port
                               :strict-host-key-checking *strict-host-key-checking*})]
-    (when-let [{:keys [host port]} (parse-socks-proxy)]
+    (when-let [{:keys [host port]} (when proxy?
+                                     (parse-socks-proxy))]
       (.setProxy session (ProxySOCKS5. host port)))
     (doto session
       (.setServerAliveInterval ssh-server-alive-interval-ms)
