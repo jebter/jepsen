@@ -1312,20 +1312,19 @@
                                       (swap! sleep-calls conj [process seconds]))
                                     nil))))]
       (let [generator (autosched/quiet-generator)
-            test      {:concurrency 2}]
-        (is (= {:type :invoke :f :snapshot}
-               (gen/op generator test 0)))
-        (is (= {:type :invoke :f :snapshot}
-               (gen/op generator test 1)))
+            test      {:concurrency 2}
+            snapshot  {:type :invoke :f :snapshot}
+            p0-sleeps (vec (repeat (dec autosched/quiet-snapshot-count)
+                                   [0 autosched/quiet-snapshot-interval-seconds]))]
+        (is (= snapshot (gen/op generator test 0)))
+        (is (= snapshot (gen/op generator test 1)))
         (is (= [] @sleep-calls))
-        (is (= {:type :invoke :f :snapshot}
-               (gen/op generator test 0)))
-        (is (= [[0 autosched/quiet-snapshot-interval-seconds]]
-               @sleep-calls))
-        (is (= {:type :invoke :f :snapshot}
-               (gen/op generator test 1)))
-        (is (= [[0 autosched/quiet-snapshot-interval-seconds]
-                [1 autosched/quiet-snapshot-interval-seconds]]
+        (dotimes [_ (dec autosched/quiet-snapshot-count)]
+          (is (= snapshot (gen/op generator test 0))))
+        (is (= p0-sleeps @sleep-calls))
+        (is (nil? (gen/op generator test 0)))
+        (is (= snapshot (gen/op generator test 1)))
+        (is (= (conj p0-sleeps [1 autosched/quiet-snapshot-interval-seconds])
                @sleep-calls))))))
 
 (deftest schedule-metadata-disappearance-is-node-local

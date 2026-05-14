@@ -18,8 +18,13 @@
 (def agg-refresh-seconds 7)
 (def purge-start-delay 2)
 (def purge-next-seconds 11)
-(def quiet-snapshot-count 7)
-(def quiet-snapshot-interval-seconds 6)
+(def refresh-retry-backoff-ceiling-seconds 120)
+;; TiDB backs off failed MView refresh retries up to two minutes under faults.
+;; Keep the quiet window long enough to observe the next retry and a stable pass.
+(def quiet-snapshot-count 17)
+(def quiet-snapshot-interval-seconds 15)
+(def quiet-window-seconds
+  (* (dec quiet-snapshot-count) quiet-snapshot-interval-seconds))
 
 (def group-count 4)
 (def write-fns [:insert :update-value :update-value :move-group :delete])
