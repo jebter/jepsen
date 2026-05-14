@@ -11,6 +11,10 @@
   (is (false? (autosched/retryable-snapshot-error?
                (RuntimeException. "non-retryable snapshot failure")))))
 
+(deftest quiet-window-covers-refresh-retry-backoff
+  (is (>= autosched/quiet-window-seconds
+          (* 2 autosched/refresh-retry-backoff-ceiling-seconds))))
+
 (deftest snapshot-with-reconnect-retries-safe-point-timeout
   (let [attempts      (atom 0)
         conn-holder   (atom nil)
