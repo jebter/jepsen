@@ -3,9 +3,24 @@
             [jepsen.control :as c]
             [jepsen.control.util :as cu]
             [jepsen.nemesis :as jn]
+            [jepsen.nemesis.time :as nt]
             [slingshot.slingshot :refer [throw+ try+]]
             [tidb.db :as db]
             [tidb.nemesis :as nemesis]))
+
+(deftest clock-reset-retries-until-offset-is-stable
+  (let [attempts (atom 0)
+        offsets  (atom [186.0 4.0])]
+    (with-redefs [nt/reset-time! (fn []
+                                   (swap! attempts inc))
+                  nt/current-offset (fn []
+                                      (let [offset (first @offsets)]
+                                        (swap! offsets rest)
+                                        offset))]
+      (is (= 4.0
+             (nt/reset-time-until-stable! {:max-attempts 3
+                                           :max-abs-offset-seconds 5})))
+      (is (= 2 @attempts)))))
 
 (deftest process-nemesis-single-node-process-faults
   (let [test    {:nodes [:node-0 :node-1 :node-2 :node-3 :node-4]}

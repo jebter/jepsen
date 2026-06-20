@@ -1700,7 +1700,11 @@
         op        (gen/op generator test :nemesis)]
     (is (= {:type :info
             :f :reset-clock
-            :value ["n1" "n2" "n3"]}
+            :value ["n1" "n2" "n3"]
+            :pre-reset-sleep-ms nemesis/final-clock-reset-drain-ms
+            :max-attempts nemesis/final-clock-reset-attempts
+            :retry-sleep-ms nemesis/final-clock-reset-retry-sleep-ms
+            :max-abs-offset-seconds nemesis/final-clock-reset-max-abs-offset-seconds}
            op))))
 
 (deftest lifecycle-artifact-state-diff-only-checks-expected-keys
