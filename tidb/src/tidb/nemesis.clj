@@ -405,6 +405,28 @@
     (when (seq gens)
       (gen/mix gens))))
 
+(def final-clock-reset-drain-ms
+  "Wait long enough for an interrupted strobe-time process to finish before the
+  final reset. strobe-gen caps duration at 32 seconds."
+  35000)
+
+(def final-clock-reset-retry-sleep-ms 5000)
+(def final-clock-reset-attempts 3)
+(def final-clock-reset-max-abs-offset-seconds 5)
+
+(defn final-clock-reset-op
+  "Builds a stricter final clock reset op than the randomized reset generator.
+  The final quiet phase assumes clocks are back near the client wall clock, so
+  wait out any lingering strobe process and retry reset if the offset is still
+  outside the checker budget."
+  [test _]
+  (op :reset-clock
+      (:nodes test)
+      :pre-reset-sleep-ms final-clock-reset-drain-ms
+      :max-attempts final-clock-reset-attempts
+      :retry-sleep-ms final-clock-reset-retry-sleep-ms
+      :max-abs-offset-seconds final-clock-reset-max-abs-offset-seconds))
+
 (defn mixed-generator
   "Takes a nemesis options map `n`, and constructs a generator for all nemesis
   operations. This generator is used during normal nemesis operations."
@@ -469,8 +491,7 @@
   operations."
   [n]
   (->> (cond-> []
-         (:clock-skew n)      (conj (fn [test _]
-                                      (op :reset-clock (:nodes test))))
+         (:clock-skew n)      (conj final-clock-reset-op)
          (:pause-pd n)        (conj :resume-pd)
          (:pause-kv n)        (conj :resume-kv)
          (:pause-db n)        (conj :resume-db)

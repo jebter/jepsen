@@ -75,6 +75,36 @@
   ([]     (c/su (c/exec :ntpdate :-b "ntp1.aliyun.com")))
   ([test] (c/with-test-nodes test (reset-time!))))
 
+(defn reset-time-until-stable!
+  "Resets the local node clock and returns the final offset. Optional keys:
+
+  :pre-reset-sleep-ms waits before the first reset, useful when a prior
+  strobe-time command may still be exiting.
+
+  :max-attempts, :retry-sleep-ms, and :max-abs-offset-seconds retry reset-time!
+  while the observed clock offset remains outside the requested budget."
+  [{:keys [pre-reset-sleep-ms
+           max-attempts
+           retry-sleep-ms
+           max-abs-offset-seconds]
+    :or   {pre-reset-sleep-ms 0
+           max-attempts 1
+           retry-sleep-ms 0}}]
+  (when (pos? pre-reset-sleep-ms)
+    (Thread/sleep pre-reset-sleep-ms))
+  (loop [attempt 1]
+    (reset-time!)
+    (let [offset (current-offset)]
+      (if (or (nil? max-abs-offset-seconds)
+              (<= (Math/abs (double offset))
+                  (double max-abs-offset-seconds))
+              (>= attempt max-attempts))
+        offset
+        (do
+          (when (pos? retry-sleep-ms)
+            (Thread/sleep retry-sleep-ms))
+          (recur (inc attempt)))))))
+
 (defn bump-time!
   "Adjusts the clock by delta milliseconds. Returns the time offset from the
   current local wall clock, in seconds."
@@ -110,8 +140,12 @@
     (invoke! [_ test op]
       (let [res (case (:f op)
                   :reset (c/on-nodes test (:value op) (fn [test node]
-                                                        (reset-time!)
-                                                        (current-offset)))
+                                                        (reset-time-until-stable!
+                                                         (select-keys op
+                                                                      [:pre-reset-sleep-ms
+                                                                       :max-attempts
+                                                                       :retry-sleep-ms
+                                                                       :max-abs-offset-seconds]))))
 
                   :check-offsets (c/on-nodes test (fn [test node]
                                                     (current-offset)))
