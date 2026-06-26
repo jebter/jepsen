@@ -617,14 +617,14 @@ That pinned-`next-time-ms` pattern also links rerun6c back to the older samples:
 
 That matters because rerun6c is still not a reproduction of the original `8060108` host/SQL `94s` split. It is better treated as another scheduler/runtime-history failure mode that can coexist with `:purge-not-progressing`, not as fresh evidence for a stable residual-skew or shared-backend theory.
 
-## Smallest verified reproduction for the scheduler future-pin bug
+## Smallest verified reproduction for scheduler future-pin behavior
 
 For issue filing and handoff, treat this as the smallest **verified** reproduction so far:
 
 - workload: `mv-autosched-time`
 - nemesis: `clock-skew`
 - scope: one fresh direct Jepsen run on one fresh bridge-managed testbed
-- goal: reproduce the scheduler stall shape without depending on the original `8060108` residual-`94s` host/SQL split
+- goal: reproduce the scheduler future-pin shape without depending on the original `8060108` residual-`94s` host/SQL split
 
 The direct Jepsen path is still the simplest checker-backed repro. As of `2026-03-25`, there is also a verified lower-level SQL-driven repro, but only for the all-node bump/reset variant documented below; the earlier single-node `node-0 +90s / hold 20s / reset` SQL variant still did **not** reproduce the future-pin shape.
 
@@ -692,7 +692,7 @@ jq -r '
 ' "$snapshots_json"
 ```
 
-Treat the run as reproducing the core product bug when all of these hold:
+Treat the run as reproducing the core scheduler future-pin behavior when all of these hold:
 
 - anomalies include `:no-post-reset-convergence` and `:no-post-reset-stability`
 - `distinct-backend-count` matches the node count and `multi-node-backends = []`, so this is not a shared-backend artifact
@@ -700,7 +700,7 @@ Treat the run as reproducing the core product bug when all of these hold:
 - on one node's snapshot table, `row-refresh.next-time-ms` keeps stepping forward while `agg-refresh.next-time-ms` stays pinned to one future timestamp
 - `row-refresh.last-success-read-tso` keeps advancing while `agg-refresh.last-success-read-tso` stays frozen
 
-If `log-purge.last-purged-tso` also stays equal to the stale aggregate TSO and `log-row-count` stays flat, that strengthens the same bug as a downstream purge symptom. `:purge-not-progressing` is helpful but not required to establish the core scheduler future-pin failure. If `log-purge.next-time-ms` is still ahead of `db-now-ms`, expect warning `:purge-delayed-by-future-next-time` instead of treating that quiet-phase sample as a hard purge failure.
+If `log-purge.last-purged-tso` also stays equal to the stale aggregate TSO and `log-row-count` stays flat, that strengthens the same future-pin diagnosis as a downstream purge symptom. `:purge-not-progressing` is helpful but not required to establish the core scheduler future-pin shape. If `log-purge.next-time-ms` is still ahead of `db-now-ms`, expect warning `:purge-delayed-by-future-next-time` instead of treating that quiet-phase sample as a hard purge failure.
 
 Do not use `mysql.tidb_mview_refresh_hist.refresh_time` or `endtime` alone to prove that refresh or purge never ran. Those wall-clock fields can be dirtied by the reset itself, and `#66849` means the history tables may miss records even when work actually executed. Prefer the quiet-phase `next-time-ms`, `last-success-read-tso`, `last-purged-tso`, and TSO-decoded physical time when deciding whether this bucket reproduced.
 
@@ -709,8 +709,9 @@ Current root-cause summary for this bucket:
 - automatic refresh and purge persist an absolute `NEXT_TIME` computed from local `NOW() + interval`
 - after a backward wall-clock reset, `MVService` only compares the stored absolute `NEXT_TIME` against current wall clock; it does not rebase, clamp, or catch up the schedule
 - the quiet-window signature is therefore a future-pinned `next-time-ms` plus flat `LAST_SUCCESS_READ_TSO` / `LAST_PURGED_TSO` until wall clock reaches the pinned timestamp
+- `#66843` was closed as not a bug on 2026-05-06; do not use this shape by itself as a release-gate product bug unless a new requirement says the scheduler must rebase or clamp future-pinned `NEXT_TIME`
 
-When choosing an external anchor, use `#66843` in `references/known_issues.md` for the underlying scheduler time-boundary stall and `#67671` for the missing operator-facing diagnostics around future-pinned `NEXT_TIME`. Treat `#66843` as the closest open bug, not as an exact duplicate, unless the trigger is literally a DST fall-back rather than a Jepsen `clock-skew` backward reset.
+When choosing an external anchor, use `#67671` for the missing operator-facing diagnostics around future-pinned `NEXT_TIME`. Treat `#66843` only as historical context for the scheduler time-boundary discussion, not as an open bug or exact duplicate.
 
 Interpret `manual_only` carefully:
 
@@ -726,7 +727,7 @@ Classify the failure before changing code:
 
 ## Verified SQL-level future-pin reproduction
 
-The `2026-03-25` bridge-managed SQL repro below is now verified as a lower-level reproduction of the scheduler future-pin bug:
+The `2026-03-25` bridge-managed SQL repro below is now verified as a lower-level reproduction of the scheduler future-pin behavior:
 
 - fresh testbed only, created and cleaned up by `mview_testbed_bridge.sh`
 - bootstrap with `mv-stateful + none`
@@ -781,7 +782,7 @@ Read that carefully:
 
 That last point matters for wording:
 
-- call this a verified SQL-level reproduction of the **post-reset future-pin bug**
+- call this a verified SQL-level reproduction of the **post-reset future-pin behavior**
 - do not overstate it as a permanent dead stall unless later samples prove the components still do not recover after wall clock reaches the pinned timestamp
 - if you need the narrower `rerun4` / `rerun6c` shape where `row-refresh` keeps advancing but `agg-refresh` stays pinned, keep using the direct Jepsen `mv-autosched-time + clock-skew` path above
 
